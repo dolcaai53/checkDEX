@@ -2,7 +2,7 @@
 
 ## Stav projektu
 
-**Aktuální stav:** ✅ Projekt dokončen — Fáze 1–7 hotové, 83 testů prochází, push na GitHub
+**Aktuální stav:** ✅ Projekt běží v produkci na mainnetu — Fáze 1–7 hotové, 83 testů prochází, runtime opravy ověřeny live
 
 ---
 
@@ -84,6 +84,17 @@
 
 ---
 
+## Runtime opravy při nasazení (2026-05-07)
+
+| Problém | Příčina | Oprava |
+|---|---|---|
+| `pydantic ValidationError` při startu | `UNREALIZED_PNL_THRESHOLD_USDC=` prázdný string nelze parsovat jako `float` | `@field_validator` s `empty_str_to_none` |
+| `404` na všech API endpointech | SDK má zastaralou doménu `api.extended.exchange`; správná je `api.starknet.extended.exchange` | `dataclasses.replace()` v `connect()` |
+| `401 Unauthorized` | Extended Exchange vyžaduje `X-Client-Id` header (nový požadavek); SDK ho nepodporuje | Injekce custom `aiohttp.ClientSession` s defaultním headerem do SDK's `_BaseModule__session` |
+| `get_open_orders failed: unknown error` | pydantic v2 ukládá `ResponseStatus` jako string `'OK'`, ne enum; `!=` vrací vždy `True` | `_unwrap()` porovnává proti oběma variantám |
+| `ValidationError` v `get_orders_history` | MARKET ordery v historii nemají `price` field; SDK model vyžaduje ho jako povinný | Raw HTTP volání s `_map_raw_order()` (toleruje chybějící `price`) |
+| `EXTENDED_CLIENT_ID` vs `EXTENDED_VAULT` | Client ID je samostatná hodnota generovaná spolu s API klíčem v Extended Exchange UI | Nový config field `EXTENDED_CLIENT_ID`; fallback na vault pokud není nastaven |
+
 ## Klíčové technické poznámky
 
 - Vše běží v Dockeru: `docker compose build`, `docker compose run --rm test`, `docker compose up`
@@ -93,3 +104,6 @@
 - `POSITION_UPDATED` se odesílá POUZE při změně size, ne při pohybu mark price
 - PnL % fallback: `(realised_pnl / (entry_price * size)) * 100`, označit jako `(approx.)`
 - Race condition pro zmizelé ordery: 2 retry cykly → DISAPPEARED_UNKNOWN
+- Extended Exchange API doména: `https://api.starknet.extended.exchange/api/v1` (SDK má zastaralou)
+- `X-Client-Id` header = Client ID z Extended Exchange UI (ne Vault Number)
+- MARKET ordery v orders history nemají `price` field → raw HTTP + vlastní parser

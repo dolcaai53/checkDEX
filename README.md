@@ -41,16 +41,19 @@ tests/                  — pytest test suite (83 tests, no network required)
 
 ## Extended Exchange integration
 
-Authentication uses the official [x10-python-trading](https://github.com/x10xchange/python_sdk) SDK. Four credentials are required by the `StarkPerpetualAccount` initialiser:
+Authentication uses the official [x10-python-trading](https://github.com/x10xchange/python_sdk) SDK. When you generate API keys in the Extended Exchange web UI, five values are produced — all five are required:
 
 | Variable | Description |
 |---|---|
-| `EXTENDED_API_KEY` | API key from the Extended web UI |
+| `EXTENDED_API_KEY` | API key — sent as `X-Api-Key` header |
 | `EXTENDED_PUBLIC_KEY` | Stark public key (0x…) |
 | `EXTENDED_PRIVATE_KEY` | Stark private key (0x…) |
-| `EXTENDED_VAULT` | Vault ID from your account |
+| `EXTENDED_VAULT` | Vault Number |
+| `EXTENDED_CLIENT_ID` | Client ID — sent as `X-Client-Id` header |
 
-All four values are passed to the SDK, but only `EXTENDED_API_KEY` is used for the read-only monitoring calls (sent as the `X-Api-Key` header). The private key is never used for signing in this system.
+`EXTENDED_PRIVATE_KEY` and `EXTENDED_PUBLIC_KEY` are passed to the SDK initialiser but never used for signing — this is a read-only system.
+
+**API endpoint note:** The SDK ships with an outdated base URL (`api.extended.exchange`). checkDEX automatically patches it to the current endpoint `api.starknet.extended.exchange` at startup — no manual change is needed.
 
 ### Polling mode
 
@@ -91,7 +94,8 @@ Key variables:
 | `EXTENDED_API_KEY` | — | Required |
 | `EXTENDED_PUBLIC_KEY` | — | Required |
 | `EXTENDED_PRIVATE_KEY` | — | Required |
-| `EXTENDED_VAULT` | — | Required |
+| `EXTENDED_VAULT` | — | Required (Vault Number) |
+| `EXTENDED_CLIENT_ID` | — | Required (Client ID; falls back to EXTENDED_VAULT if unset) |
 | `EXTENDED_NETWORK` | `mainnet` | `mainnet` or `testnet` |
 | `TELEGRAM_BOT_TOKEN` | — | Required |
 | `TELEGRAM_CHAT_ID` | — | Required |
