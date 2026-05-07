@@ -218,3 +218,137 @@ No changes to `EventEngine`, `Monitor`, `TelegramNotifier`, or `Database` are ne
 ## Healthcheck
 
 The Docker healthcheck verifies that `/tmp/healthy` was touched within the last 60 seconds. The monitor writes this file after every successful poll cycle in any of the three loops. If all loops stall (e.g., API outage lasting > 60 s), the container is marked unhealthy.
+
+## Auto-start after server reboot
+
+The `docker-compose.yml` uses `restart: unless-stopped`. For the container to start automatically after a server reboot, the Docker daemon itself must be enabled as a systemd service:
+
+```bash
+sudo systemctl enable docker
+```
+
+Run this once on the server. After that, any container that was running when the server shut down will be restarted automatically by Docker on boot.
+
+To verify Docker is enabled:
+
+```bash
+sudo systemctl is-enabled docker
+```
+
+**Restart policy reference:**
+
+| Policy | Behaviour after reboot |
+|---|---|
+| `no` | does not start |
+| `always` | always starts, even after `docker stop` |
+| `unless-stopped` | starts unless manually stopped |
+| `on-failure` | starts only after non-zero exit |
+
+`unless-stopped` is the correct choice here — if you manually stop the container (`docker compose stop`), it will not restart automatically on the next reboot.
+
+## Verifying the system started correctly
+
+**Quick status check:**
+
+```bash
+docker compose ps
+```
+
+The `STATUS` column should show `healthy` within ~45 seconds of startup. While the container is initialising it shows `starting`; if all polling loops fail for over 60 seconds it shows `unhealthy`.
+
+**Read the logs:**
+
+```bash
+docker compose logs --tail=50 app
+```
+
+A clean startup looks like this:
+
+```
+{"message": "checkDEX starting", "exchange": "Extended", "network": "mainnet"}
+{"message": "Database connected", "path": "/data/state.db"}
+{"message": "Exchange connected", "exchange": "Extended"}
+{"message": "Telegram notifier ready"}
+{"message": "Startup notification sent"}
+{"message": "Orders loop started", "interval": 60}
+{"message": "Positions loop started", "interval": 60}
+{"message": "History loop started", "interval": 60}
+```
+
+**Telegram startup notification:**
+
+If `ENABLE_STARTUP_NOTIFICATION=true` (default), a message is sent to your Telegram chat every time the container starts. The absence of this message is a reliable signal that something went wrong.
+
+**Healthcheck file directly:**
+
+```bash
+docker compose exec app python -c "import os,time; f='/tmp/healthy'; print('OK' if os.path.exists(f) and time.time()-os.path.getmtime(f)<60 else 'FAIL')"
+```
+
+## Troubleshooting
+
+### Container stuck in `Restarting` loop (exit code 1)
+
+The container exits immediately and Docker keeps restarting it. Check the logs:
+
+```bash
+docker compose logs --tail=50 app
+```
+
+**Common cause: `sqlite3.OperationalError: unable to open database file`**
+
+The `/data` directory inside the container is mounted from `./data` on the host. If Docker created `./data` automatically it is owned by `root`, but the app runs as `appuser` (uid 1000) and cannot write to it.
+
+Fix on the server:
+
+```bash
+cd /path/to/checkDEX
+sudo chown -R 1000:1000 data
+docker compose up -d
+```
+
+### Container shows `unhealthy`
+
+The container is running but the healthcheck fails. This means the polling loops are not completing successfully.
+
+1. Check logs for errors: `docker compose logs --tail=50 app`
+2. Look for `Error in orders loop`, `Error in positions loop`, or `Error in history loop`.
+3. Common causes: API authentication failure, network timeout, or Telegram error (see below).
+
+### Telegram `400 Bad Request`
+
+The app crashes at startup with:
+
+```
+aiohttp.client_exceptions.ClientResponseError: 400, message='Bad Request'
+```
+
+This always means `TELEGRAM_CHAT_ID` in `.env` is wrong or the bot has not been added to the target chat.
+
+**How to find the correct chat ID:**
+
+1. Send any message to your bot (or add it to a group and send a message there).
+2. Open in a browser — replace `<TOKEN>` with your bot token:
+   ```
+   https://api.telegram.org/bot<TOKEN>/getUpdates
+   ```
+3. Find `"chat": {"id": ...}` in the JSON response.
+4. Copy the value exactly into `.env` as `TELEGRAM_CHAT_ID`.
+
+Private chats have a positive integer ID (`123456789`). Groups and channels have a negative ID (`-1001234567890`).
+
+After updating `.env`, restart the container:
+
+```bash
+docker compose up -d
+```
+
+### Bot token exposed in logs
+
+If the bot token appears in Docker logs (e.g. in a `400 Bad Request` URL), **revoke it immediately**:
+
+1. Open Telegram → [@BotFather](https://t.me/BotFather) → `/mybots` → select your bot → *API Token* → *Revoke current token*.
+2. Copy the new token into `.env`.
+3. Restart the container.
+
+A revoked token stops working instantly. Any process or person who saw the old token in logs can no longer use it.
