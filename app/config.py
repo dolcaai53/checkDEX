@@ -46,11 +46,29 @@ class Config(BaseSettings):
     # Optional thresholds
     unrealized_pnl_threshold_usdc: float | None = None
 
+    # Daily position summary
+    enable_daily_summary: bool = True
+    daily_summary_time: str = "08:00"  # HH:MM UTC
+
     @field_validator("unrealized_pnl_threshold_usdc", "extended_client_id", mode="before")
     @classmethod
     def _empty_str_to_none(cls, v: object) -> object:
         if isinstance(v, str) and v.strip() == "":
             return None
+        return v
+
+    @field_validator("daily_summary_time")
+    @classmethod
+    def _validate_time(cls, v: str) -> str:
+        try:
+            parts = v.split(":")
+            if len(parts) != 2:
+                raise ValueError
+            hour, minute = int(parts[0]), int(parts[1])
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError
+        except (ValueError, AttributeError):
+            raise ValueError(f"DAILY_SUMMARY_TIME must be HH:MM (UTC), got: {v!r}")
         return v
 
     # Logging

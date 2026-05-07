@@ -19,6 +19,7 @@ from app.models.order import Order, OrderSide, OrderStatus, OrderType
 from app.models.position import Position, PositionSide
 from app.models.trade import Trade
 from app.notifiers.telegram import (
+    format_daily_summary,
     format_order_filled,
     format_order_opened,
     format_order_updated,
@@ -220,6 +221,48 @@ def test_position_closed_breakeven() -> None:
     msg = format_position_closed(PositionClosedEvent(trade=_trade("0")))
     assert "⚪" in msg
     assert "BREAKEVEN" in msg
+
+
+# ---------------------------------------------------------------------------
+# DAILY SUMMARY
+# ---------------------------------------------------------------------------
+
+def test_daily_summary_with_positions() -> None:
+    msg = format_daily_summary("Extended", "mainnet", [_position()])
+    assert "DAILY POSITION SUMMARY" in msg
+    assert "📊" in msg
+    assert "Extended (mainnet)" in msg
+    assert "BTC-USD" in msg
+    assert "LONG" in msg
+    assert "Open positions: 1" in msg
+    assert "Total uPnL" in msg
+    assert "+62.38 USDC" in msg
+
+
+def test_daily_summary_no_positions() -> None:
+    msg = format_daily_summary("Extended", "mainnet", [])
+    assert "DAILY POSITION SUMMARY" in msg
+    assert "No open positions." in msg
+    assert "Total uPnL" not in msg
+
+
+def test_daily_summary_total_upnl_sums_multiple() -> None:
+    p1 = _position()  # uPnL = +62.38
+    p2 = Position(
+        market="ETH-USD",
+        exchange="Extended",
+        side=PositionSide.SHORT,
+        size=Decimal("2.5"),
+        entry_price=Decimal("2450.00"),
+        unrealized_pnl=Decimal("30.00"),
+    )
+    msg = format_daily_summary("Extended", "mainnet", [p1, p2])
+    assert "Open positions: 2" in msg
+    assert "92.38" in msg  # 62.38 + 30.00
+
+
+def test_daily_summary_no_invalid_html() -> None:
+    _no_invalid_tags(format_daily_summary("Extended", "mainnet", [_position()]))
 
 
 # ---------------------------------------------------------------------------

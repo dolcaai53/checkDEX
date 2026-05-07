@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import aiohttp
 
@@ -14,6 +15,7 @@ from app.models.events import (
     PositionOpenedEvent,
     PositionUpdatedEvent,
 )
+from app.models.position import Position
 from app.storage.database import Database
 from app.utils.pnl import calculate_pnl_pct, fmt_pct, fmt_pnl, pnl_label
 from app.utils.retry import with_retry
@@ -161,6 +163,35 @@ def format_position_closed(event: PositionClosedEvent) -> str:
     return "\n".join(lines)
 
 
+def format_daily_summary(exchange: str, network: str, positions: list[Position]) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    lines = [
+        "📊 <b>DAILY POSITION SUMMARY</b>",
+        f"Exchange: {exchange} ({network})",
+        now,
+        "",
+    ]
+    if not positions:
+        lines.append("No open positions.")
+    else:
+        total_upnl: Decimal | None = None
+        for p in positions:
+            mark = f"{p.mark_price:.2f}" if p.mark_price else "—"
+            upnl_str = fmt_pnl(p.unrealized_pnl) if p.unrealized_pnl is not None else "—"
+            leverage = f" {p.leverage}x" if p.leverage else ""
+            lines.append(f"<b>{p.market}</b> {p.side}{leverage}")
+            lines.append(f"  Size: {p.size} | Entry: {p.entry_price:.2f}")
+            lines.append(f"  Mark: {mark} | uPnL: {upnl_str}")
+            lines.append("")
+            if p.unrealized_pnl is not None:
+                total_upnl = p.unrealized_pnl if total_upnl is None else total_upnl + p.unrealized_pnl
+        lines.append("─────────────────────")
+        if total_upnl is not None:
+            lines.append(f"Total uPnL: <b>{fmt_pnl(total_upnl)}</b>")
+        lines.append(f"Open positions: {len(positions)}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # TelegramNotifier
 # ---------------------------------------------------------------------------
@@ -261,3 +292,12 @@ class TelegramNotifier:
         t = event.trade
         nid = f"position_closed:{t.exchange}:{t.id}"
         await self._send(format_position_closed(event), nid)
+
+    async def send_daily_summary(self, exchange: str, positions: list[Position]) -> None:
+        if not self._config.enable_daily_summary:
+            return
+        # Deduplicate per calendar day so a restart mid-day doesn't double-send.
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        nid = f"daily_summary:{exchange}:{date_str}"
+        text = format_daily_summary(exchange, self._config.extended_network, positions)
+        await self._send(text, nid)

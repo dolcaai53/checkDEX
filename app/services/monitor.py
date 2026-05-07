@@ -16,6 +16,7 @@ from app.models.events import (
     PositionOpenedEvent,
     PositionUpdatedEvent,
 )
+from app.models.position import Position
 from app.notifiers.telegram import TelegramNotifier
 from app.services.event_engine import EventEngine
 from app.storage.database import Database
@@ -60,6 +61,7 @@ class Monitor:
         self._notifier = notifier
         self._engine = EventEngine(db)
         self._stop = asyncio.Event()
+        self._current_positions: list[Position] = []
 
     async def run(self) -> None:
         tasks = [
@@ -67,6 +69,8 @@ class Monitor:
             asyncio.create_task(self._positions_loop(), name="positions_loop"),
             asyncio.create_task(self._history_loop(), name="history_loop"),
         ]
+        if self._config.enable_daily_summary:
+            tasks.append(asyncio.create_task(self._daily_summary_loop(), name="daily_summary_loop"))
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -116,6 +120,7 @@ class Monitor:
         while not self._stop.is_set():
             try:
                 current = await self._exchange.get_positions()
+                self._current_positions = current
                 logger.debug(
                     "Positions polled",
                     extra={"count": len(current), "exchange": exchange},
@@ -154,6 +159,38 @@ class Monitor:
                 logger.exception("Error in history loop", extra={"exchange": exchange})
 
             await self._interruptible_sleep(interval)
+
+    async def _daily_summary_loop(self) -> None:
+        summary_time = self._config.daily_summary_time
+        h, m = map(int, summary_time.split(":"))
+        logger.info("Daily summary loop started", extra={"scheduled_utc": summary_time})
+
+        while not self._stop.is_set():
+            now = datetime.now(timezone.utc)
+            target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+
+            wait_seconds = int((target - now).total_seconds())
+            logger.debug("Daily summary scheduled", extra={"in_seconds": wait_seconds})
+            await self._interruptible_sleep(wait_seconds)
+
+            if self._stop.is_set():
+                break
+
+            try:
+                await self._notifier.send_daily_summary(
+                    self._exchange.exchange_name,
+                    self._current_positions,
+                )
+                _touch_healthy()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Error sending daily summary")
+
+            # Sleep past the trigger minute to avoid double-fire on the same day.
+            await self._interruptible_sleep(70)
 
     # ------------------------------------------------------------------
     # Event dispatch
