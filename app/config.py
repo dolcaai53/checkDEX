@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +18,7 @@ class Config(BaseSettings):
     extended_public_key: str
     extended_private_key: str
     extended_vault: str
+    extended_client_id: str | None = None  # X-Client-Id header; defaults to extended_vault if unset
     extended_network: str = "mainnet"
 
     # Telegram
@@ -44,6 +45,13 @@ class Config(BaseSettings):
 
     # Optional thresholds
     unrealized_pnl_threshold_usdc: float | None = None
+
+    @field_validator("unrealized_pnl_threshold_usdc", "extended_client_id", mode="before")
+    @classmethod
+    def _empty_str_to_none(cls, v: object) -> object:
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        return v
 
     # Logging
     log_level: str = "INFO"

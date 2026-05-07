@@ -6,6 +6,8 @@ from decimal import Decimal
 
 import aiohttp
 
+import dataclasses
+
 from x10.errors import X10Error
 from x10.perpetual.accounts import StarkPerpetualAccount
 from x10.perpetual.configuration import MAINNET_CONFIG, TESTNET_CONFIG
@@ -14,7 +16,7 @@ from x10.perpetual.orders import OrderSide as SdkOrderSide
 from x10.perpetual.positions import PositionHistoryModel, PositionModel
 from x10.perpetual.trading_client.trading_client import PerpetualTradingClient
 from x10.perpetual.trades import AccountTradeModel
-from x10.utils.http import ResponseStatus, WrappedApiResponse
+from x10.utils.http import CLIENT_TIMEOUT, ResponseStatus, WrappedApiResponse
 
 from app.config import Config
 from app.exceptions import ExchangeAPIError, ExchangeConnectionError
@@ -60,10 +62,35 @@ def _unix_ms_to_utc(ts: int) -> datetime:
 
 def _unwrap(response: WrappedApiResponse, label: str):
     """Extract data from WrappedApiResponse or raise ExchangeAPIError."""
-    if response.status != ResponseStatus.OK or response.data is None:
+    # Pydantic v2 may deserialise the status field as a plain string instead of the
+    # ResponseStatus enum, so check both the enum value and its string equivalent.
+    status_ok = response.status in (ResponseStatus.OK, ResponseStatus.OK.value)
+    if not status_ok or response.data is None:
         error_msg = str(response.error) if response.error else "unknown error"
         raise ExchangeAPIError(f"{label} failed: {error_msg}")
     return response.data
+
+
+def _map_raw_order(raw: dict, exchange: str) -> Order:
+    """Map raw JSON order dict to internal Order, tolerating missing price (MARKET orders).
+
+    The raw API uses camelCase field names (filledQty, createdTime, updatedTime).
+    """
+    price_raw = raw.get("price")
+    price = Decimal(str(price_raw)) if price_raw not in (None, "", "0", "0.0", "0.0000000000000000") else None
+    return Order(
+        id=str(raw["id"]),
+        exchange=exchange,
+        market=str(raw["market"]),
+        side=OrderSide(str(raw["side"]).upper()),
+        type=_ORDER_TYPE_MAP.get(str(raw.get("type", "LIMIT")).upper(), OrderType.LIMIT),
+        price=price,
+        qty=Decimal(str(raw["qty"])),
+        filled_qty=Decimal(str(raw.get("filledQty") or "0")),
+        status=_ORDER_STATUS_MAP.get(str(raw.get("status", "NEW")).upper(), OrderStatus.OPEN),
+        created_at=_unix_ms_to_utc(raw["createdTime"]) if raw.get("createdTime") else None,
+        updated_at=_unix_ms_to_utc(raw["updatedTime"]) if raw.get("updatedTime") else None,
+    )
 
 
 def map_order(sdk_order: OpenOrderModel, exchange: str) -> Order:
@@ -155,20 +182,47 @@ class ExtendedAdapter(ExchangeAdapter):
     def __init__(self, config: Config) -> None:
         self._config = config
         self._client: PerpetualTradingClient | None = None
+        self._session: aiohttp.ClientSession | None = None
+        self._api_base_url: str = ""
 
     @property
     def exchange_name(self) -> str:
         return "Extended"
 
     async def connect(self) -> None:
-        sdk_config = MAINNET_CONFIG if self._config.extended_network == "mainnet" else TESTNET_CONFIG
+        # The SDK ships with outdated mainnet URLs; patch both with the current domain.
+        if self._config.extended_network == "mainnet":
+            sdk_config = dataclasses.replace(
+                MAINNET_CONFIG,
+                api_base_url="https://api.starknet.extended.exchange/api/v1",
+                onboarding_url="https://api.starknet.extended.exchange",
+            )
+        else:
+            sdk_config = TESTNET_CONFIG
         account = StarkPerpetualAccount(
             vault=self._config.extended_vault,
             private_key=self._config.extended_private_key,
             public_key=self._config.extended_public_key,
             api_key=self._config.extended_api_key,
         )
+        self._api_base_url = sdk_config.api_base_url
         self._client = PerpetualTradingClient(sdk_config, stark_account=account)
+
+        # Extended Exchange requires X-Client-Id (= vault) on all authenticated requests.
+        # The SDK doesn't support this header natively, so we inject a pre-built aiohttp
+        # session with the header as a default. The SDK's BaseModule stores the session in
+        # _BaseModule__session (Python name-mangling for __session inside a class body).
+        client_id = self._config.extended_client_id or self._config.extended_vault
+        self._session = aiohttp.ClientSession(
+            headers={
+                "X-Client-Id": str(client_id),
+                "X-Api-Key": self._config.extended_api_key,
+                "Accept": "application/json",
+            },
+            timeout=CLIENT_TIMEOUT,
+        )
+        self._client.account._BaseModule__session = self._session
+
         logger.info(
             "Extended adapter initialised",
             extra={"network": self._config.extended_network},
@@ -221,18 +275,29 @@ class ExtendedAdapter(ExchangeAdapter):
         *since* is accepted for interface compatibility but ignored — Extended SDK
         does not support time-based filtering. Returns the most recent
         _HISTORY_FETCH_LIMIT records; deduplication is handled by the event engine.
+
+        Uses a raw HTTP call instead of the SDK model to handle MARKET orders that
+        omit the price field (which the SDK's OpenOrderModel requires as non-optional).
         """
-        client = self._client_or_raise()
+        if self._session is None:
+            raise ExchangeConnectionError("ExtendedAdapter not connected — call connect() first")
+
+        url = f"{self._api_base_url}/user/orders/history"
+        params = {"limit": str(_HISTORY_FETCH_LIMIT)}
+
         try:
-            response = await with_retry(
-                lambda: client.account.get_orders_history(limit=_HISTORY_FETCH_LIMIT),
-                label="get_orders_history",
-            )
-        except (aiohttp.ClientError, X10Error) as exc:
+            async with self._session.get(url, params=params) as resp:
+                resp.raise_for_status()
+                payload = await resp.json()
+        except aiohttp.ClientError as exc:
             raise ExchangeConnectionError(f"get_orders_history failed: {exc}") from exc
 
-        data = _unwrap(response, "get_orders_history")
-        orders = [map_order(o, self.exchange_name) for o in data]
+        orders: list[Order] = []
+        for raw in payload.get("data") or []:
+            try:
+                orders.append(_map_raw_order(raw, self.exchange_name))
+            except Exception:
+                logger.debug("Skipping unparseable order history entry", extra={"id": raw.get("id")})
         logger.debug("Fetched orders history", extra={"count": len(orders)})
         return orders
 
