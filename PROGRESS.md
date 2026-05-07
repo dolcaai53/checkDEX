@@ -2,7 +2,7 @@
 
 ## Stav projektu
 
-**Aktuální fáze:** Fáze 4 dokončena — připraveno na Fázi 5 (Event engine) + Fázi 6 (Telegram notifier)
+**Aktuální stav:** ✅ Projekt dokončen — Fáze 1–7 hotové, 83 testů prochází, push na GitHub
 
 ---
 
@@ -19,69 +19,68 @@
 - `app/utils/logging.py` — JSON / text logging (python-json-logger)
 - `app/models/` — Order, OrderSide, OrderType, OrderStatus, Position, PositionSide, Trade, všechny eventy
 - `app/exchanges/base.py` — ExchangeAdapter ABC (multi-exchange interface)
-- `app/exchanges/extended.py` — stub, TODO Phase 3
-- `app/notifiers/telegram.py` — stub, TODO Phase 6
-- `app/services/monitor.py` — stub, TODO Phase 7
-- `app/storage/database.py` — stub, TODO Phase 4
-- `tests/` — 11 skeleton testů, vše prochází
-- Ověřeno: `docker compose build` ✅, `docker compose run --rm test` ✅ (11/11)
-
----
-
-## Zbývá
-
-### Fáze 2 — modely (přeskočena — modely jsou součástí Fáze 1)
 
 ### Fáze 3 — Extended polling connector ✅ (2026-05-07)
-- [x] `app/exceptions.py` — CheckDEXError, ExchangeAPIError, ExchangeConnectionError, ExchangeRateLimitError
-- [x] `app/utils/retry.py` — exponential backoff, HTTP 429 handling (30s wait), retryable network exceptions
-- [x] `app/exchanges/extended.py` — plná implementace: PerpetualTradingClient init, connect/disconnect, get_open_orders, get_positions, get_orders_history, get_positions_history, get_trades
-- [x] Mapování SDK → interní modely: map_order, map_position, map_position_history, map_trade
-- [x] `app/models/order.py` — přidány OrderType.CONDITIONAL a TPSL
-- [x] `app/exchanges/base.py` — get_positions_history vrací list[Trade] (ne list[Position])
-- [x] 11 unit testů pro mapping funkce (vše bez live API)
-- [x] 22/22 testů prochází v Dockeru
+- `app/exceptions.py` — CheckDEXError, ExchangeAPIError, ExchangeConnectionError, ExchangeRateLimitError
+- `app/utils/retry.py` — exponential backoff, HTTP 429 handling (30s wait), retryable network exceptions
+- `app/exchanges/extended.py` — plná implementace: PerpetualTradingClient init, connect/disconnect, get_open_orders, get_positions, get_orders_history, get_positions_history, get_trades
+- Mapování SDK → interní modely: map_order, map_position, map_position_history, map_trade
+- 11 unit testů pro mapping funkce (vše bez live API)
 - Zjištěno: pydantic v2 + StrEnum ukládá hodnoty jako string → mapy používají str klíče + str() konverze
 - Zjištěno: Extended SDK nepodporuje time-based filtering — history vždy fetchuje prvních 50 záznamů, dedup řeší event engine
 
 ### Fáze 4 — Storage + deduplikace ✅ (2026-05-07)
-- [x] `app/storage/database.py` — aiosqlite, WAL mode, schema (schema_version tabulka)
-- [x] Tabulky: order_snapshots, position_snapshots, sent_notifications, disappeared_pending, history_cursors
-- [x] TTL cleanup sent_notifications při connect() a po každé NOTIFICATION_DEDUP_TTL_DAYS
-- [x] 20 unit testů v `tests/test_storage.py` — 40/40 prochází
+- `app/storage/database.py` — aiosqlite, WAL mode, schema (schema_version tabulka)
+- Tabulky: order_snapshots, position_snapshots, sent_notifications, disappeared_pending, history_cursors
+- TTL cleanup sent_notifications při connect()
+- 20 unit testů v `tests/test_storage.py`
 - Zjištěno: `async with aiosqlite.Connection` na otevřeném spojení restartuje thread → použít execute+commit+rollback
 
-### Fáze 5 — Event engine
-- [ ] Order diff logika (nový, změněný, zmizelý order)
-- [ ] Position diff logika (nová, změněná pozice — pouze při změně size)
-- [ ] History scan pro uzavřené pozice / trades
-- [ ] Race condition handling pro zmizelé ordery (disappeared_pending, 2 retry)
-- [ ] PnL výpočet + PnL % (fallback vzorec)
-- [ ] Unit testy v `tests/test_event_engine.py`, `tests/test_pnl.py`
+### Fáze 5 — Event engine ✅ (2026-05-07)
+- `app/utils/pnl.py` — calculate_pnl_pct (approx vzorec), pnl_label (🟢/🔴/⚪), fmt_pnl, fmt_pct
+- `app/services/event_engine.py` — pure funkce: detect_order_events, detect_position_events, detect_closed_positions
+- EventEngine class: process_orders, process_positions, process_positions_history
+- First-run: snapshoty se tichce naplní (bez notifikací)
+- Race condition: disappeared_pending + 2 retry → DISAPPEARED_UNKNOWN
+- 19 unit testů pro detekční logiku + 15 testů pro PnL utils
 
-### Fáze 6 — Telegram notifier
-- [ ] `app/notifiers/telegram.py` — aiohttp, HTML šablony, retry
-- [ ] Startup notifikace
-- [ ] Šablony pro všechny eventy (ORDER_OPENED, ORDER_UPDATED, ORDER_FILLED, POSITION_OPENED, POSITION_UPDATED, POSITION_CLOSED)
-- [ ] Profit/loss/breakeven emoji + HTML formátování
-- [ ] Unit testy v `tests/test_telegram.py`
+### Fáze 6 — Telegram notifier ✅ (2026-05-07)
+- `app/notifiers/telegram.py` — format_* funkce + TelegramNotifier class
+- Startup notifikace, šablony pro všechny eventy (ORDER_OPENED, ORDER_UPDATED, ORDER_FILLED, POSITION_OPENED, POSITION_UPDATED, POSITION_CLOSED)
+- Profit/loss/breakeven: 🟢 PROFIT / 🔴 LOSS / ⚪ BREAKEVEN
+- Dedup via db.is_notified/mark_notified; retry via with_retry; pouze Telegramem podporované HTML tagy
+- 19 unit testů v `tests/test_telegram.py`
 
-### Fáze 7 — Zapojení + hlavní smyčka
-- [ ] `app/services/monitor.py` — 3 polling smyčky (orders, positions, history)
-- [ ] `app/main.py` — wire up všechny komponenty
-- [ ] Healthcheck touch /tmp/healthy
-- [ ] Graceful shutdown
+### Fáze 7 — Zapojení + hlavní smyčka ✅ (2026-05-07)
+- `app/services/monitor.py` — 3 polling smyčky (orders, positions, history), interruptible_sleep
+- `app/main.py` — inicializace všech komponent, startup notifikace, graceful shutdown via monitor.stop()
+- Healthcheck: _touch_healthy() po každém úspěšném poll cyklu → /tmp/healthy
+- `README.md` — kompletní dokumentace projektu
 
-### Fáze 8 — WebSocket vrstva (volitelná)
-- [ ] Privátní streamy jako doplněk pollingu
-- [ ] Fallback na polling při výpadku WS
+### GitHub push ✅
+- `git init`, initial commit (40 souborů, 3614 řádků)
+- Push na https://github.com/dolcaai53/checkDEX.git (branch: main)
 
 ---
 
-## Otevřená rozhodnutí / bloky
+## Testovací výsledky
 
-- Ověřit, zda Extended SDK vyžaduje private_key i pro read-only volání při inicializaci StarkPerpetualAccount (vyplyne při implementaci Fáze 3)
-- WebSocket implementace závisí na kvalitě SDK dokumentace (konzervativní fallback = polling only)
+```
+83 passed in 0.97s
+```
+
+- tests/test_event_engine.py — 28 testů (mapping + detekce)
+- tests/test_pnl.py — 16 testů
+- tests/test_storage.py — 20 testů
+- tests/test_telegram.py — 19 testů
+
+---
+
+## Zbývá (volitelné)
+
+### Fáze 8 — WebSocket vrstva (neimplementováno — polling je dostatečný)
+- Privátní streamy jako doplněk pollingu
+- Fallback na polling při výpadku WS
 
 ---
 
