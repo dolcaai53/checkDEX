@@ -1,0 +1,24 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  test:
+    build: .
+    env_file: .env.test
+    volumes:
+      - test-data:/data
+    command: python -m pytest tests/ -v
+    profiles:
+      - test
+
+volumes:
+  test-data:

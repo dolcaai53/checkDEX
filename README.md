@@ -1,0 +1,216 @@
+# checkDEX
+
+Read-only trading monitor for decentralised exchanges. Watches your account on Extended Exchange, detects order and position events, and sends formatted Telegram notifications.
+
+## What it does
+
+- Monitors open orders, partial fills, full fills, cancels, and rejects.
+- Monitors open positions and size changes.
+- Detects closed positions with realised PnL (profit / loss / breakeven).
+- Sends all events as HTML-formatted messages to a Telegram chat.
+- Deduplicates notifications so the same event is never sent twice, even after a restart.
+- Designed from the start for multi-exchange extensibility (Lighter, Hyperliquid, etc.).
+
+## Architecture
+
+```
+app/
+  config.py             — pydantic-settings configuration from env vars
+  main.py               — entry point; wires all components and handles SIGTERM/SIGINT
+  exchanges/
+    base.py             — ExchangeAdapter ABC (multi-exchange interface)
+    extended.py         — Extended Exchange implementation
+  models/
+    order.py            — Order model and enums
+    position.py         — Position model and enums
+    trade.py            — Trade model (closed positions)
+    events.py           — OrderOpenedEvent, OrderFilledEvent, PositionClosedEvent, …
+  services/
+    event_engine.py     — pure diff functions + EventEngine orchestrator
+    monitor.py          — three independent polling loops
+  notifiers/
+    telegram.py         — Telegram Bot API notifier with dedup and retry
+  storage/
+    database.py         — aiosqlite persistence layer
+  utils/
+    pnl.py              — PnL calculation and formatting
+    retry.py            — exponential backoff retry helper
+    logging.py          — structured JSON logging setup
+tests/                  — pytest test suite (83 tests, no network required)
+```
+
+## Extended Exchange integration
+
+Authentication uses the official [x10-python-trading](https://github.com/x10xchange/python_sdk) SDK. Four credentials are required by the `StarkPerpetualAccount` initialiser:
+
+| Variable | Description |
+|---|---|
+| `EXTENDED_API_KEY` | API key from the Extended web UI |
+| `EXTENDED_PUBLIC_KEY` | Stark public key (0x…) |
+| `EXTENDED_PRIVATE_KEY` | Stark private key (0x…) |
+| `EXTENDED_VAULT` | Vault ID from your account |
+
+All four values are passed to the SDK, but only `EXTENDED_API_KEY` is used for the read-only monitoring calls (sent as the `X-Api-Key` header). The private key is never used for signing in this system.
+
+### Polling mode
+
+All data is fetched via periodic polling — there is no WebSocket layer. Three independent asyncio loops run concurrently:
+
+| Loop | Data source | Default interval |
+|---|---|---|
+| Orders | `get_open_orders()` + `get_orders_history()` | 60 s |
+| Positions | `get_positions()` | 60 s |
+| History | `get_positions_history()` | 60 s |
+
+Intervals are configurable via `POLL_INTERVAL_ORDERS_SECONDS`, `POLL_INTERVAL_POSITIONS_SECONDS`, `POLL_INTERVAL_HISTORY_SECONDS`.
+
+The Extended SDK uses cursor-based pagination with no time-based filtering. checkDEX always fetches the most recent 50 records from history endpoints and relies on ID-based deduplication in the database.
+
+**WebSocket mode** is not implemented. The polling baseline is reliable and sufficient for 60-second intervals.
+
+## Setting up the Telegram bot
+
+1. Talk to [@BotFather](https://t.me/BotFather) → `/newbot` → copy the bot token.
+2. Add the bot to your target group (or start a private chat with it).
+3. Get the chat ID: send a message, then open `https://api.telegram.org/bot<TOKEN>/getUpdates` and find `"chat":{"id":…}`.
+4. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in your `.env`.
+
+## Configuration
+
+Copy `.env.example` to `.env` and fill in your values:
+
+```
+cp .env.example .env
+$EDITOR .env
+```
+
+Key variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `EXTENDED_API_KEY` | — | Required |
+| `EXTENDED_PUBLIC_KEY` | — | Required |
+| `EXTENDED_PRIVATE_KEY` | — | Required |
+| `EXTENDED_VAULT` | — | Required |
+| `EXTENDED_NETWORK` | `mainnet` | `mainnet` or `testnet` |
+| `TELEGRAM_BOT_TOKEN` | — | Required |
+| `TELEGRAM_CHAT_ID` | — | Required |
+| `POLL_INTERVAL_ORDERS_SECONDS` | `60` | Orders polling interval |
+| `POLL_INTERVAL_POSITIONS_SECONDS` | `60` | Positions polling interval |
+| `POLL_INTERVAL_HISTORY_SECONDS` | `60` | History polling interval |
+| `STATE_DB_PATH` | `/data/state.db` | SQLite file path |
+| `NOTIFICATION_DEDUP_TTL_DAYS` | `30` | How long to keep sent-notification IDs |
+| `ENABLE_ORDER_OPENED` | `true` | Toggle individual notification types |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `LOG_FORMAT` | `json` | `json` (default) or `text` |
+
+## Running in Docker (recommended)
+
+```bash
+# Build and start
+docker compose up -d
+
+# View logs
+docker logs -f checkdex-app-1
+
+# Stop
+docker compose down
+```
+
+The `data/` directory on the host is mounted as `/data` in the container. The SQLite database is written there. This directory persists across container restarts and image updates.
+
+### Updating the image without losing state
+
+```bash
+# Pull / rebuild the image
+docker compose build --pull
+
+# Restart with the new image
+docker compose up -d
+```
+
+The `data/` volume is never removed by these commands. No state is lost, no old notifications are re-sent.
+
+### Running tests
+
+```bash
+docker compose run --rm --build test
+```
+
+No API keys or network access required — all tests use in-memory SQLite and mock objects.
+
+## Persistence and deduplication
+
+The SQLite database stores:
+
+| Table | Purpose |
+|---|---|
+| `order_snapshots` | Last known state of open orders per exchange |
+| `position_snapshots` | Last known state of open positions per exchange |
+| `sent_notifications` | IDs of notifications already sent (TTL: `NOTIFICATION_DEDUP_TTL_DAYS`) |
+| `disappeared_pending` | Orders that vanished from open orders but haven't appeared in history yet |
+| `history_cursors` | Cursor/offset bookmarks for history endpoints |
+
+On first run the snapshots are populated silently — no notifications are sent for pre-existing orders and positions. Subsequent runs diff the new snapshot against the stored one and emit only new events.
+
+Notification IDs follow the pattern `{event_type}:{exchange}:{id}`. Before sending, the notifier checks whether the ID is already in `sent_notifications`. After a successful send it records the ID. This prevents duplicate messages after a crash or restart.
+
+## Closed position notifications: profit / loss / breakeven
+
+When a position closes, `realised_pnl` from the Extended positions history is used as the authoritative value.
+
+Classification:
+
+| Condition | Emoji | Label |
+|---|---|---|
+| `realised_pnl > 0` | 🟢 | PROFIT |
+| `realised_pnl < 0` | 🔴 | LOSS |
+| `realised_pnl == 0` | ⚪ | BREAKEVEN |
+
+**PnL %** is an approximation:
+
+```
+pnl_pct = (realised_pnl / (entry_price × size)) × 100
+```
+
+This does not include leverage, fees, or funding. The result is labelled `(approx.)` in the message.
+
+Example profit message:
+
+```
+🟢 POSITION CLOSED — PROFIT
+Exchange: Extended
+Market: BTC-USD
+Side: LONG
+Size: 0.25
+Entry: 63250.50
+Exit: 63880.00
+PnL: +157.38 USDC
+PnL %: +0.99% (approx.)
+Duration: 01h 42m
+Closed at: 2026-05-07 13:42:11 UTC
+```
+
+## Disappeared order handling
+
+If an order vanishes from `get_open_orders()` and is not yet in `get_orders_history()` (a race condition common with fast fills), checkDEX queues it as `disappeared_pending` and retries for 2 poll cycles. If the order appears in history within those retries, the correct event (FILLED or CANCELLED) is emitted. If it never appears, an `ORDER UPDATED` with status `DISAPPEARED_UNKNOWN` is sent so you are aware.
+
+## Known limitations and assumptions
+
+- **Polling only** — no WebSocket layer. Minimum detection latency equals the poll interval (default 60 s).
+- **PnL % is approximate** — does not include leverage, fees, or funding rate.
+- **Extended SDK cursor pagination** — the history endpoint returns the most recent 50 records. Very high-frequency trading (>50 events per poll interval) could cause missed events.
+- **Single exchange** — only Extended Exchange is implemented. The adapter interface is ready for Lighter and Hyperliquid.
+- **No POSITION_UPDATED on unrealized PnL** — only size changes trigger `POSITION UPDATED` notifications, preventing spam from mark price fluctuations.
+
+## Adding Lighter or Hyperliquid
+
+1. Create `app/exchanges/lighter.py` (or `hyperliquid.py`) implementing `ExchangeAdapter`.
+2. Translate the exchange's native order/position/trade objects into the internal models (`Order`, `Position`, `Trade`).
+3. Instantiate the new adapter in `app/main.py` alongside (or instead of) `ExtendedAdapter`.
+
+No changes to `EventEngine`, `Monitor`, `TelegramNotifier`, or `Database` are needed.
+
+## Healthcheck
+
+The Docker healthcheck verifies that `/tmp/healthy` was touched within the last 60 seconds. The monitor writes this file after every successful poll cycle in any of the three loops. If all loops stall (e.g., API outage lasting > 60 s), the container is marked unhealthy.

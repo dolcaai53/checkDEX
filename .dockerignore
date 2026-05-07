@@ -1,0 +1,15 @@
+.env
+.env.test
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+data/
+*.db
+README.md
+CLAUDE.md
+DOC.md
