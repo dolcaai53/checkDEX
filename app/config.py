@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,15 +11,22 @@ class Config(BaseSettings):
         case_sensitive=False,
     )
 
-    # Extended API — all four required by SDK initializer
+    # Exchange selector
+    active_exchange: str = "extended"  # "extended" | "hyperliquid"
+
+    # Extended API — required only when active_exchange == "extended"
     # NOTE: private_key and public_key are passed to the SDK but never used for
     # signing — this is a read-only system; only api_key is sent in HTTP requests.
-    extended_api_key: str
-    extended_public_key: str
-    extended_private_key: str
-    extended_vault: str
+    extended_api_key: str = ""
+    extended_public_key: str = ""
+    extended_private_key: str = ""
+    extended_vault: str = ""
     extended_client_id: str | None = None  # X-Client-Id header; defaults to extended_vault if unset
     extended_network: str = "mainnet"
+
+    # Hyperliquid — required only when active_exchange == "hyperliquid"
+    hyperliquid_wallet_address: str | None = None  # 0x... public wallet address; no private key needed
+    hyperliquid_testnet: bool = False
 
     # Telegram
     telegram_bot_token: str
@@ -50,7 +57,12 @@ class Config(BaseSettings):
     enable_daily_summary: bool = True
     daily_summary_time: str = "08:00"  # HH:MM UTC
 
-    @field_validator("unrealized_pnl_threshold_usdc", "extended_client_id", mode="before")
+    @field_validator(
+        "unrealized_pnl_threshold_usdc",
+        "extended_client_id",
+        "hyperliquid_wallet_address",
+        mode="before",
+    )
     @classmethod
     def _empty_str_to_none(cls, v: object) -> object:
         if isinstance(v, str) and v.strip() == "":
@@ -70,6 +82,33 @@ class Config(BaseSettings):
         except (ValueError, AttributeError):
             raise ValueError(f"DAILY_SUMMARY_TIME must be HH:MM (UTC), got: {v!r}")
         return v
+
+    @model_validator(mode="after")
+    def _validate_exchange_config(self) -> "Config":
+        if self.active_exchange == "extended":
+            missing = [
+                name
+                for name, val in [
+                    ("EXTENDED_API_KEY", self.extended_api_key),
+                    ("EXTENDED_PUBLIC_KEY", self.extended_public_key),
+                    ("EXTENDED_PRIVATE_KEY", self.extended_private_key),
+                    ("EXTENDED_VAULT", self.extended_vault),
+                ]
+                if not val
+            ]
+            if missing:
+                raise ValueError(f"Missing required Extended config: {', '.join(missing)}")
+        elif self.active_exchange == "hyperliquid":
+            if not self.hyperliquid_wallet_address:
+                raise ValueError(
+                    "HYPERLIQUID_WALLET_ADDRESS is required when ACTIVE_EXCHANGE=hyperliquid"
+                )
+        else:
+            raise ValueError(
+                f"Unknown ACTIVE_EXCHANGE value: {self.active_exchange!r}. "
+                "Must be 'extended' or 'hyperliquid'."
+            )
+        return self
 
     # Logging
     log_level: str = "INFO"

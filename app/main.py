@@ -5,7 +5,9 @@ import logging
 import signal
 
 from app.config import Config
+from app.exchanges.base import ExchangeAdapter
 from app.exchanges.extended import ExtendedAdapter
+from app.exchanges.hyperliquid import HyperliquidAdapter
 from app.notifiers.telegram import TelegramNotifier
 from app.services.monitor import Monitor
 from app.storage.database import Database
@@ -16,6 +18,12 @@ logger = logging.getLogger(__name__)
 _monitor: Monitor | None = None
 
 
+def _create_exchange_adapter(config: Config) -> ExchangeAdapter:
+    if config.active_exchange == "hyperliquid":
+        return HyperliquidAdapter(config)
+    return ExtendedAdapter(config)
+
+
 async def main() -> None:
     global _monitor
 
@@ -24,14 +32,14 @@ async def main() -> None:
 
     logger.info(
         "checkDEX starting",
-        extra={"exchange": "Extended", "network": config.extended_network},
+        extra={"exchange": config.active_exchange},
     )
 
     db = Database(config.state_db_path)
     await db.connect()
     logger.info("Database connected", extra={"path": config.state_db_path})
 
-    exchange = ExtendedAdapter(config)
+    exchange = _create_exchange_adapter(config)
     await exchange.connect()
     logger.info("Exchange connected", extra={"exchange": exchange.exchange_name})
 
