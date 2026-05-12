@@ -181,6 +181,7 @@ class Monitor:
             try:
                 await self._notifier.send_daily_summary(
                     self._exchange.exchange_name,
+                    self._exchange.network,
                     self._current_positions,
                 )
                 _touch_healthy()

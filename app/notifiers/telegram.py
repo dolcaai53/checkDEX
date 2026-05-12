@@ -244,15 +244,10 @@ class TelegramNotifier:
     # Public send methods — each checks its config toggle before sending
     # ------------------------------------------------------------------
 
-    def _get_network(self) -> str:
-        if self._config.active_exchange == "hyperliquid":
-            return "testnet" if self._config.hyperliquid_testnet else "mainnet"
-        return self._config.extended_network
-
-    async def send_startup(self, exchange: str) -> None:
+    async def send_startup(self, exchange: str, network: str) -> None:
         if not self._config.enable_startup_notification:
             return
-        text = format_startup(exchange, self._get_network())
+        text = format_startup(exchange, network)
         await with_retry(lambda: self._post(text), label="telegram:startup")
         logger.info("Startup notification sent")
 
@@ -299,11 +294,11 @@ class TelegramNotifier:
         nid = f"position_closed:{t.exchange}:{t.id}"
         await self._send(format_position_closed(event), nid)
 
-    async def send_daily_summary(self, exchange: str, positions: list[Position]) -> None:
+    async def send_daily_summary(self, exchange: str, network: str, positions: list[Position]) -> None:
         if not self._config.enable_daily_summary:
             return
         # Deduplicate per calendar day so a restart mid-day doesn't double-send.
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         nid = f"daily_summary:{exchange}:{date_str}"
-        text = format_daily_summary(exchange, self._get_network(), positions)
+        text = format_daily_summary(exchange, network, positions)
         await self._send(text, nid)

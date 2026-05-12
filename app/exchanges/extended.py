@@ -189,6 +189,10 @@ class ExtendedAdapter(ExchangeAdapter):
     def exchange_name(self) -> str:
         return "Extended"
 
+    @property
+    def network(self) -> str:
+        return self._config.extended_network
+
     async def connect(self) -> None:
         # The SDK ships with outdated mainnet URLs; patch both with the current domain.
         if self._config.extended_network == "mainnet":

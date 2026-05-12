@@ -172,6 +172,10 @@ class HyperliquidAdapter(ExchangeAdapter):
     def exchange_name(self) -> str:
         return "Hyperliquid"
 
+    @property
+    def network(self) -> str:
+        return "testnet" if self._config.hyperliquid_testnet else "mainnet"
+
     async def connect(self) -> None:
         try:
             from hyperliquid.info import Info  # type: ignore[import]

@@ -11,8 +11,8 @@ class Config(BaseSettings):
         case_sensitive=False,
     )
 
-    # Exchange selector
-    active_exchange: str = "extended"  # "extended" | "hyperliquid"
+    # Exchange selector — comma-separated list, e.g. "extended" or "extended,hyperliquid"
+    active_exchanges: list[str] = ["extended"]
 
     # Extended API — required only when active_exchange == "extended"
     # NOTE: private_key and public_key are passed to the SDK but never used for
@@ -57,6 +57,13 @@ class Config(BaseSettings):
     enable_daily_summary: bool = True
     daily_summary_time: str = "08:00"  # HH:MM UTC
 
+    @field_validator("active_exchanges", mode="before")
+    @classmethod
+    def _parse_exchanges(cls, v: object) -> object:
+        if isinstance(v, str):
+            return [x.strip() for x in v.split(",") if x.strip()]
+        return v
+
     @field_validator(
         "unrealized_pnl_threshold_usdc",
         "extended_client_id",
@@ -85,29 +92,33 @@ class Config(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_exchange_config(self) -> "Config":
-        if self.active_exchange == "extended":
-            missing = [
-                name
-                for name, val in [
-                    ("EXTENDED_API_KEY", self.extended_api_key),
-                    ("EXTENDED_PUBLIC_KEY", self.extended_public_key),
-                    ("EXTENDED_PRIVATE_KEY", self.extended_private_key),
-                    ("EXTENDED_VAULT", self.extended_vault),
-                ]
-                if not val
-            ]
-            if missing:
-                raise ValueError(f"Missing required Extended config: {', '.join(missing)}")
-        elif self.active_exchange == "hyperliquid":
-            if not self.hyperliquid_wallet_address:
+        if not self.active_exchanges:
+            raise ValueError("ACTIVE_EXCHANGES must not be empty")
+        valid = {"extended", "hyperliquid"}
+        for exchange in self.active_exchanges:
+            if exchange not in valid:
                 raise ValueError(
-                    "HYPERLIQUID_WALLET_ADDRESS is required when ACTIVE_EXCHANGE=hyperliquid"
+                    f"Unknown exchange {exchange!r} in ACTIVE_EXCHANGES. "
+                    f"Valid values: {', '.join(sorted(valid))}"
                 )
-        else:
-            raise ValueError(
-                f"Unknown ACTIVE_EXCHANGE value: {self.active_exchange!r}. "
-                "Must be 'extended' or 'hyperliquid'."
-            )
+            if exchange == "extended":
+                missing = [
+                    name
+                    for name, val in [
+                        ("EXTENDED_API_KEY", self.extended_api_key),
+                        ("EXTENDED_PUBLIC_KEY", self.extended_public_key),
+                        ("EXTENDED_PRIVATE_KEY", self.extended_private_key),
+                        ("EXTENDED_VAULT", self.extended_vault),
+                    ]
+                    if not val
+                ]
+                if missing:
+                    raise ValueError(f"Missing required Extended config: {', '.join(missing)}")
+            elif exchange == "hyperliquid":
+                if not self.hyperliquid_wallet_address:
+                    raise ValueError(
+                        "HYPERLIQUID_WALLET_ADDRESS is required when hyperliquid is in ACTIVE_EXCHANGES"
+                    )
         return self
 
     # Logging

@@ -15,56 +15,60 @@ from app.utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
 
-_monitor: Monitor | None = None
+_monitors: list[Monitor] = []
 
 
-def _create_exchange_adapter(config: Config) -> ExchangeAdapter:
-    if config.active_exchange == "hyperliquid":
+def _create_exchange_adapter(config: Config, exchange_id: str) -> ExchangeAdapter:
+    if exchange_id == "hyperliquid":
         return HyperliquidAdapter(config)
     return ExtendedAdapter(config)
 
 
 async def main() -> None:
-    global _monitor
+    global _monitors
 
     config = Config()
     setup_logging(config.log_level, config.log_format)
 
     logger.info(
         "checkDEX starting",
-        extra={"exchange": config.active_exchange},
+        extra={"exchanges": config.active_exchanges},
     )
 
     db = Database(config.state_db_path)
     await db.connect()
     logger.info("Database connected", extra={"path": config.state_db_path})
 
-    exchange = _create_exchange_adapter(config)
-    await exchange.connect()
-    logger.info("Exchange connected", extra={"exchange": exchange.exchange_name})
-
     notifier = TelegramNotifier(config, db)
     await notifier.connect()
     logger.info("Telegram notifier ready")
 
-    await notifier.send_startup(exchange.exchange_name)
+    exchanges: list[ExchangeAdapter] = []
+    for exchange_id in config.active_exchanges:
+        exchange = _create_exchange_adapter(config, exchange_id)
+        await exchange.connect()
+        logger.info("Exchange connected", extra={"exchange": exchange.exchange_name})
+        await notifier.send_startup(exchange.exchange_name, exchange.network)
+        exchanges.append(exchange)
 
-    _monitor = Monitor(config, exchange, db, notifier)
+    _monitors = [Monitor(config, ex, db, notifier) for ex in exchanges]
 
     try:
-        await _monitor.run()
+        await asyncio.gather(*[m.run() for m in _monitors])
     finally:
         logger.info("Shutting down components...")
         await notifier.disconnect()
-        await exchange.disconnect()
+        for exchange in exchanges:
+            await exchange.disconnect()
         await db.disconnect()
         logger.info("checkDEX stopped cleanly")
 
 
 def _handle_signal(loop: asyncio.AbstractEventLoop) -> None:
     logger.info("Shutdown signal received")
-    if _monitor is not None:
-        loop.create_task(_monitor.stop())
+    if _monitors:
+        for m in _monitors:
+            loop.create_task(m.stop())
     else:
         loop.stop()
 

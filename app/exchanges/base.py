@@ -21,6 +21,11 @@ class ExchangeAdapter(ABC):
     def exchange_name(self) -> str:
         """Human-readable exchange name used in log messages and notifications."""
 
+    @property
+    @abstractmethod
+    def network(self) -> str:
+        """Network identifier, e.g. 'mainnet' or 'testnet'."""
+
     @abstractmethod
     async def connect(self) -> None:
         """Initialise the API client and verify connectivity."""
