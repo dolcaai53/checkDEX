@@ -191,6 +191,29 @@ class Database:
         )
         await self._db().commit()
 
+    async def mark_notified_many(self, notification_ids: list[str]) -> None:
+        """Zapise vice notifikaci jako odeslane v jedne transakci (vse, nebo nic)."""
+        now = _now_utc()
+        db = self._db()
+        try:
+            await db.executemany(
+                "INSERT OR IGNORE INTO sent_notifications(notification_id, sent_at) VALUES (?,?)",
+                [(nid, now) for nid in notification_ids],
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+    async def has_notification_with_prefix(self, prefix: str) -> bool:
+        """True, pokud existuje odeslana notifikace, jejiz ID zacina *prefix*."""
+        # substr misto LIKE — "_" v ID by LIKE bral jako zastupny znak.
+        async with self._db().execute(
+            "SELECT 1 FROM sent_notifications WHERE substr(notification_id, 1, ?) = ? LIMIT 1",
+            (len(prefix), prefix),
+        ) as cur:
+            return await cur.fetchone() is not None
+
     async def _cleanup_old_notifications(self) -> int:
         """Delete sent_notifications older than dedup_ttl_days. Returns deleted count."""
         cutoff = (

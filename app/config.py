@@ -11,8 +11,12 @@ class Config(BaseSettings):
         case_sensitive=False,
     )
 
-    # Exchange selector — comma-separated list, e.g. "extended" or "extended,hyperliquid"
-    active_exchanges: list[str] = ["extended"]
+    # Exchange selector — comma-separated list, e.g. "extended" or "extended,hyperliquid".
+    # JSON seznam (["extended","hyperliquid"]) funguje taky.
+    # "| str" je nutne: pydantic-settings 2.2 (novejsi nejde, x10 drzi pydantic 2.5)
+    # cte list z env jako JSON a text s carkou by odmitl. U unionu preda text,
+    # ktery neni JSON, validatoru _parse_exchanges. Po validaci je to vzdy list.
+    active_exchanges: list[str] | str = ["extended"]
 
     # Extended API — required only when active_exchange == "extended"
     # NOTE: private_key and public_key are passed to the SDK but never used for
@@ -24,7 +28,7 @@ class Config(BaseSettings):
     extended_client_id: str | None = None  # X-Client-Id header; defaults to extended_vault if unset
     extended_network: str = "mainnet"
 
-    # Hyperliquid — required only when active_exchange == "hyperliquid"
+    # Hyperliquid — required only when ACTIVE_EXCHANGES contains "hyperliquid"
     hyperliquid_wallet_address: str | None = None  # 0x... public wallet address; no private key needed
     hyperliquid_testnet: bool = False
 

@@ -222,3 +222,31 @@ async def test_cursor_overwrite(db: Database) -> None:
 async def test_cursor_isolated_per_key(db: Database) -> None:
     await db.set_cursor("orders_history:Extended", "aaa")
     assert await db.get_cursor("positions_history:Extended") is None
+
+
+# ---------------------------------------------------------------------------
+# Hromadny zapis a hledani podle prefixu (prvni beh historie)
+# ---------------------------------------------------------------------------
+
+async def test_mark_notified_many(db: Database) -> None:
+    await db.mark_notified("position_closed:Extended:1")  # uz existujici nevadi
+    await db.mark_notified_many(["position_closed:Extended:1", "position_closed:Extended:2"])
+    assert await db.is_notified("position_closed:Extended:1")
+    assert await db.is_notified("position_closed:Extended:2")
+
+
+async def test_mark_notified_many_empty_list(db: Database) -> None:
+    await db.mark_notified_many([])
+    assert not await db.has_notification_with_prefix("position_closed:")
+
+
+async def test_has_notification_with_prefix(db: Database) -> None:
+    await db.mark_notified("position_closed:Extended:1")
+    assert await db.has_notification_with_prefix("position_closed:Extended:")
+    assert not await db.has_notification_with_prefix("position_closed:Hyperliquid:")
+
+
+async def test_has_notification_with_prefix_treats_underscore_literally(db: Database) -> None:
+    # V LIKE by "_" znamenalo libovolny znak — "positionXclosed" nesmi projit.
+    await db.mark_notified("positionXclosed:Extended:1")
+    assert not await db.has_notification_with_prefix("position_closed:Extended:")

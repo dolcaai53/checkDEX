@@ -29,10 +29,12 @@ from app.models.order import Order, OrderSide, OrderStatus, OrderType
 from app.models.position import Position, PositionSide
 from app.models.trade import Trade
 from app.services.event_engine import (
+    EventEngine,
     detect_closed_positions,
     detect_order_events,
     detect_position_events,
 )
+from app.storage.database import Database
 
 # ---------------------------------------------------------------------------
 # Helpers — minimal valid SDK model instances
@@ -439,3 +441,109 @@ def test_detect_closed_positions_all_notified_returns_empty() -> None:
 def test_detect_closed_positions_empty_history() -> None:
     events = detect_closed_positions(recent_history=[], already_notified=set())
     assert events == []
+
+
+# ---------------------------------------------------------------------------
+# EventEngine — prvni beh (znacky v DB), skutecna SQLite v tmp_path
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+async def db(tmp_path):
+    database = Database(db_path=str(tmp_path / "engine.db"))
+    await database.connect()
+    yield database
+    await database.disconnect()
+
+
+def _hl_trade(id: str) -> Trade:
+    return _trade(id).model_copy(update={"exchange": "Hyperliquid"})
+
+
+async def test_engine_first_run_orders_is_silent(db: Database) -> None:
+    events = await EventEngine(db).process_orders("Extended", [_order("1")], [])
+    assert events == []
+    assert set(await db.get_order_snapshots("Extended")) == {"1"}
+
+
+async def test_engine_first_order_on_empty_account_notifies(db: Database) -> None:
+    assert await EventEngine(db).process_orders("Extended", [], []) == []
+    # Novy EventEngine = restart aplikace; znacka prvniho behu je v DB.
+    events = await EventEngine(db).process_orders("Extended", [_order("1")], [])
+    assert len(events) == 1
+    assert isinstance(events[0], OrderOpenedEvent)
+
+
+async def test_engine_first_position_on_empty_account_notifies(db: Database) -> None:
+    assert await EventEngine(db).process_positions("Extended", []) == []
+    events = await EventEngine(db).process_positions("Extended", [_position("BTC-USD")])
+    assert len(events) == 1
+    assert isinstance(events[0], PositionOpenedEvent)
+
+
+async def test_engine_snapshot_from_older_version_is_not_first_run(db: Database) -> None:
+    # Starsi verze ukladala jen snapshot, bez znacky prvniho behu.
+    await db.replace_order_snapshots("Extended", [_order("1")])
+    await db.replace_position_snapshots("Extended", [_position("BTC-USD")])
+    engine = EventEngine(db)
+
+    order_events = await engine.process_orders("Extended", [_order("1"), _order("2")], [])
+    position_events = await engine.process_positions(
+        "Extended", [_position("BTC-USD"), _position("ETH-USD")]
+    )
+
+    assert [e.order.id for e in order_events] == ["2"]
+    assert [e.position.market for e in position_events] == ["ETH-USD"]
+    assert await db.get_cursor("orders_initialized:Extended") is not None
+    assert await db.get_cursor("positions_initialized:Extended") is not None
+
+
+async def test_engine_first_run_is_per_exchange(db: Database) -> None:
+    engine = EventEngine(db)
+    await engine.process_orders("Extended", [], [])
+    await engine.process_positions("Extended", [])
+
+    # Nove pridana burza: existujici pozice a ordery se nehlasi.
+    hl_order = _order("9").model_copy(update={"exchange": "Hyperliquid"})
+    hl_position = _position("SOL-USDC").model_copy(update={"exchange": "Hyperliquid"})
+    assert await engine.process_orders("Hyperliquid", [hl_order], []) == []
+    assert await engine.process_positions("Hyperliquid", [hl_position]) == []
+
+
+async def test_engine_history_first_run_is_silent_and_marks_trades(db: Database) -> None:
+    engine = EventEngine(db)
+    assert await engine.process_positions_history("Extended", [_trade("1"), _trade("2")]) == []
+    assert await db.is_notified("position_closed:Extended:1")
+    assert await db.is_notified("position_closed:Extended:2")
+
+    events = await engine.process_positions_history(
+        "Extended", [_trade("1"), _trade("2"), _trade("3")]
+    )
+    assert [e.trade.id for e in events] == ["3"]
+
+
+async def test_engine_history_first_run_with_empty_history(db: Database) -> None:
+    engine = EventEngine(db)
+    assert await engine.process_positions_history("Extended", []) == []
+    events = await engine.process_positions_history("Extended", [_trade("1")])
+    assert [e.trade.id for e in events] == ["1"]
+
+
+async def test_engine_history_from_older_version_keeps_new_closes(db: Database) -> None:
+    # Starsi verze: close notifikace uz odesla, ale znacka neexistuje.
+    await db.mark_notified("position_closed:Extended:1")
+    events = await EventEngine(db).process_positions_history(
+        "Extended", [_trade("1"), _trade("2")]
+    )
+    assert [e.trade.id for e in events] == ["2"]
+    assert await db.get_cursor("history_initialized:Extended") is not None
+
+
+async def test_engine_new_exchange_history_is_silent(db: Database) -> None:
+    engine = EventEngine(db)
+    await engine.process_positions_history("Extended", [_trade("1")])
+    await engine.process_positions_history("Extended", [_trade("1"), _trade("2")])
+
+    # Hyperliquid pridany pozdeji — stare obchody nesmi prijit jako serie zprav.
+    events = await engine.process_positions_history("Hyperliquid", [_hl_trade("7"), _hl_trade("8")])
+    assert events == []
+    assert await db.is_notified("position_closed:Hyperliquid:7")

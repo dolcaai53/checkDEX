@@ -81,20 +81,33 @@
 - Denni souhrn a /positions sdili formatovani pozic (`_position_lines`)
 - 17 testu v `tests/test_commands.py`, 4 nove testy v `tests/test_telegram.py` (vcetne kontroly, ze se vzhled denniho souhrnu nezmenil)
 
+### Odolnost pri vice burzach + Hyperliquid opravy ✅ (2026-09-27)
+- Kazda burza bezi samostatne (`run_exchange` v `app/main.py`): kdyz se jedna nepripoji, ostatni monitoruji dal
+- Neuspesne pripojeni: log `Exchange connection failed` + jednou ⚠️ Telegram zprava (`send_exchange_error`, token maskovany), dalsi pokus po 30 s, pak 2x delsi az 10 min
+- Neocekavana chyba ukonci proces (Docker ho restartuje) — driv proces visel jako `unhealthy`
+- Hyperliquid: timeout 15 s na kazdy request (SDK zadny nema), konstruktor `Info` bezi ve vlakne
+- Hyperliquid: pri startu kontrola `userRole` — API (agent) penezenka se odmitne a chyba uvede adresu hlavniho uctu
+- `ACTIVE_EXCHANGES` funguje s carkou (`extended,hyperliquid`) i jako JSON seznam
+- Prvni spusteni se sleduje pro kazdou burzu zvlast (markery `*_initialized:<burza>` v `history_cursors`): prvni order/pozice na prazdnem uctu se oznami, nove pridana burza neposle davku starych POSITION CLOSED
+- `requirements.txt` — presne verze knihoven, se kterymi prochazeji testy
+- Nove testy: `tests/test_config.py` (13), `tests/test_main.py` (8), dalsi v event_engine, hyperliquid, storage, telegram
+
 ---
 
 ## Testovací výsledky
 
 ```
-126 passed in 1.29s   (2026-09-27, v Dockeru)
+177 passed, 1 warning   (2026-09-27, v Dockeru; warning = DeprecationWarning z python-json-logger)
 ```
 
 - tests/test_commands.py — 17 testu (/positions, getUpdates)
-- tests/test_event_engine.py — 28 testu (mapping + detekce)
-- tests/test_hyperliquid.py — 18 testu
+- tests/test_config.py — 13 testu (ACTIVE_EXCHANGES carka/JSON, .env.example)
+- tests/test_event_engine.py — 37 testu (mapping + detekce + prvni spusteni)
+- tests/test_hyperliquid.py — 32 testu (mapping + connect, kontrola API penezenky)
+- tests/test_main.py — 8 testu (opakovani pripojeni, nezavislost burz, uklid)
 - tests/test_pnl.py — 16 testu
-- tests/test_storage.py — 21 testu
-- tests/test_telegram.py — 26 testu
+- tests/test_storage.py — 25 testu
+- tests/test_telegram.py — 29 testu
 
 ---
 
@@ -116,6 +129,13 @@
 | `get_open_orders failed: unknown error` | pydantic v2 ukládá `ResponseStatus` jako string `'OK'`, ne enum; `!=` vrací vždy `True` | `_unwrap()` porovnává proti oběma variantám |
 | `ValidationError` v `get_orders_history` | MARKET ordery v historii nemají `price` field; SDK model vyžaduje ho jako povinný | Raw HTTP volání s `_map_raw_order()` (toleruje chybějící `price`) |
 | `EXTENDED_CLIENT_ID` vs `EXTENDED_VAULT` | Client ID je samostatná hodnota generovaná spolu s API klíčem v Extended Exchange UI | Nový config field `EXTENDED_CLIENT_ID`; fallback na vault pokud není nastaven |
+
+## Runtime opravy pri nasazeni (2026-09-27)
+
+| Problem | Pricina | Oprava |
+|---|---|---|
+| `ModuleNotFoundError: No module named 'hyperliquid'`, proces visel | Na server se nezkopiroval novy `requirements.txt`; pripojeni burzy bylo mimo try/finally | Zkopirovat `requirements.txt` + `docker compose build --no-cache`; v kodu nezavisle burzy s opakovanim pripojeni |
+| Hyperliquid neukazuje zadne pozice | V `HYPERLIQUID_WALLET_ADDRESS` byla API (agent) penezenka | Nastavit adresu hlavniho uctu; aplikace ted API penezenku sama pozna a nahlasi |
 
 ## Klíčové technické poznámky
 

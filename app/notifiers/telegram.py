@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -26,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 _API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 _UPDATES_URL = "https://api.telegram.org/bot{token}/getUpdates"
+# Delsi text chyby se ve zprave zkrati (limit Telegram zpravy je 4096 znaku).
+_MAX_ERROR_CHARS = 500
 
 
 class ExchangePositions(NamedTuple):
@@ -61,6 +64,20 @@ def format_startup(exchange: str, network: str) -> str:
         f"Exchange: {exchange} ({network})\n"
         f"Monitoring: orders, positions, trades\n"
         f"Started at: {now}"
+    )
+
+
+def format_exchange_error(exchange: str, network: str, error: str) -> str:
+    """Upozorneni, ze se burzu nepodarilo pripojit; ostatni burzy bezi dal."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    if len(error) > _MAX_ERROR_CHARS:
+        error = error[:_MAX_ERROR_CHARS] + "..."
+    return (
+        f"⚠️ <b>checkDEX — exchange connection failed</b>\n"
+        f"Exchange: {exchange} ({network})\n"
+        f"Error: <code>{html.escape(error)}</code>\n"
+        f"Monitoring of this exchange is paused, reconnecting automatically.\n"
+        f"Time: {now}"
     )
 
 
@@ -248,6 +265,14 @@ class TelegramNotifier:
             raise RuntimeError("TelegramNotifier.connect() must be called before use")
         return self._session
 
+    def safe_error(self, exc: BaseException) -> str:
+        """Popis chyby do logu bez bot tokenu (chyby aiohttp obsahuji URL s tokenem)."""
+        return self._mask_token(f"{type(exc).__name__}: {exc}")
+
+    def _mask_token(self, text: str) -> str:
+        token = self._config.telegram_bot_token
+        return text.replace(token, "***") if token else text
+
     async def _post(self, text: str) -> None:
         url = _API_URL.format(token=self._config.telegram_bot_token)
         async with self._session_or_raise().post(
@@ -279,6 +304,24 @@ class TelegramNotifier:
         text = format_startup(exchange, network)
         await with_retry(lambda: self._post(text), label="telegram:startup")
         logger.info("Startup notification sent")
+
+    async def send_exchange_error(self, exchange: str, network: str, error: str) -> bool:
+        """Upozorneni na neuspesne pripojeni burzy — bez deduplikace.
+
+        Nikdy nevyhazuje vyjimku. Vraci False, kdyz se zpravu nepodarilo
+        odeslat — volajici ji pak zkusi poslat pri dalsim neuspechu.
+        """
+        text = format_exchange_error(exchange, network, self._mask_token(error))
+        try:
+            await with_retry(lambda: self._post(text), label="telegram:exchange_error")
+        except Exception as exc:
+            logger.warning(
+                "Exchange error notification failed",
+                extra={"exchange": exchange, "error": self.safe_error(exc)},
+            )
+            return False
+        logger.info("Exchange error notification sent", extra={"exchange": exchange})
+        return True
 
     async def send_order_opened(self, event: OrderOpenedEvent) -> None:
         if not self._config.enable_order_opened:

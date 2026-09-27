@@ -38,7 +38,7 @@ app/
     pnl.py              — PnL calculation and formatting
     retry.py            — exponential backoff retry helper
     logging.py          — structured JSON logging setup
-tests/                  — pytest test suite (126 tests, no network required)
+tests/                  — pytest test suite (177 tests, no network required)
 ```
 
 ## Extended Exchange integration
@@ -72,6 +72,24 @@ Intervals are configurable via `POLL_INTERVAL_ORDERS_SECONDS`, `POLL_INTERVAL_PO
 The Extended SDK uses cursor-based pagination with no time-based filtering. checkDEX always fetches the most recent 50 records from history endpoints and relies on ID-based deduplication in the database.
 
 **WebSocket mode** is not implemented. The polling baseline is reliable and sufficient for 60-second intervals.
+
+## Hyperliquid: main account, not an API wallet
+
+Hyperliquid needs only the public wallet address in `HYPERLIQUID_WALLET_ADDRESS` — no API key, no private key.
+
+Use the address of your **main account** (shown top right on hyperliquid.xyz). An API (agent) wallet only signs trades for the main account and has no positions or orders of its own, so with its address checkDEX would see an empty account.
+
+checkDEX checks this at startup: it asks Hyperliquid for the role of the address. If it is an API wallet, Hyperliquid is not monitored and the error, including the main account address, goes to the log and to Telegram (see [When an exchange cannot connect](#when-an-exchange-cannot-connect)):
+
+```
+HYPERLIQUID_WALLET_ADDRESS 0x… is an API (agent) wallet without positions or orders of its own. Set HYPERLIQUID_WALLET_ADDRESS to the main account address: 0x…
+```
+
+Put that address into `.env` and run `docker compose up -d --force-recreate`.
+
+- If the role check itself fails (e.g. a timeout), a warning is logged and monitoring continues.
+- An address with no account activity on Hyperliquid is only logged as a warning — check it for typos.
+- Every Hyperliquid request has a 15-second timeout (the SDK sets none by default), so a slow API cannot block the monitor.
 
 ## Setting up the Telegram bot
 
@@ -116,12 +134,15 @@ Key variables:
 
 | Variable | Default | Description |
 |---|---|---|
+| `ACTIVE_EXCHANGES` | `extended` | Exchanges to monitor, comma-separated (`extended,hyperliquid`); a JSON list (`["extended","hyperliquid"]`) works too |
 | `EXTENDED_API_KEY` | — | Required |
 | `EXTENDED_PUBLIC_KEY` | — | Required |
 | `EXTENDED_PRIVATE_KEY` | — | Required |
 | `EXTENDED_VAULT` | — | Required (Vault Number) |
 | `EXTENDED_CLIENT_ID` | — | Required (Client ID; falls back to EXTENDED_VAULT if unset) |
 | `EXTENDED_NETWORK` | `mainnet` | `mainnet` or `testnet` |
+| `HYPERLIQUID_WALLET_ADDRESS` | — | Required with `hyperliquid`: main account address, not an API wallet (see [Hyperliquid](#hyperliquid-main-account-not-an-api-wallet)) |
+| `HYPERLIQUID_TESTNET` | `false` | `true` for the Hyperliquid testnet |
 | `TELEGRAM_BOT_TOKEN` | — | Required |
 | `TELEGRAM_CHAT_ID` | — | Required |
 | `ENABLE_TELEGRAM_COMMANDS` | `true` | Answer `/positions` in `TELEGRAM_CHAT_ID` (see [Telegram commands](#telegram-commands)) |
@@ -161,6 +182,8 @@ docker compose up -d
 
 The `data/` volume is never removed by these commands. No state is lost, no old notifications are re-sent.
 
+If you deploy by copying files to the server, copy every changed file except `.env` and `data/` — including `requirements.txt`. Library versions are pinned there; an image built with an old `requirements.txt` misses libraries (e.g. `hyperliquid-python-sdk is not installed`). After copying, rebuild with `docker compose build --no-cache` and start with `docker compose up -d`.
+
 ### Running tests
 
 ```bash
@@ -181,7 +204,14 @@ The SQLite database stores:
 | `disappeared_pending` | Orders that vanished from open orders but haven't appeared in history yet |
 | `history_cursors` | Cursor/offset bookmarks for history endpoints |
 
-On first run the snapshots are populated silently — no notifications are sent for pre-existing orders and positions. Subsequent runs diff the new snapshot against the stored one and emit only new events.
+The first time an exchange is monitored, checkDEX saves its current state silently:
+
+- Existing open orders and positions are stored without notifications.
+- Closed positions already in the exchange history are marked as notified, so adding a new exchange does not send a burst of old `POSITION CLOSED` messages.
+
+After that, every poll compares the new snapshot with the stored one and sends only new events — including the first order or position on an account that was empty at the first run.
+
+The first run is tracked per exchange by markers in `history_cursors` (`orders_initialized:<exchange>`, `positions_initialized:<exchange>`, `history_initialized:<exchange>`). A database from an older version that already holds snapshots or sent close notifications counts as initialised, so an upgrade sends nothing extra.
 
 Notification IDs follow the pattern `{event_type}:{exchange}:{id}`. Before sending, the notifier checks whether the ID is already in `sent_notifications`. After a successful send it records the ID. This prevents duplicate messages after a crash or restart.
 
@@ -244,6 +274,19 @@ No changes to `EventEngine`, `Monitor`, `TelegramNotifier`, or `Database` are ne
 ## Healthcheck
 
 The Docker healthcheck verifies that `/tmp/healthy` was touched within the last 60 seconds. The monitor writes this file after every successful poll cycle in any of the three loops. If all loops stall (e.g., API outage lasting > 60 s), the container is marked unhealthy.
+
+## When an exchange cannot connect
+
+Each exchange runs on its own. If one cannot connect at startup (wrong keys, API outage, API wallet address, …), the other exchanges are monitored as usual:
+
+1. The log shows `Exchange connection failed` with the reason in `error`.
+2. Telegram gets one ⚠️ **checkDEX — exchange connection failed** message with the same reason. If Telegram is unreachable at that moment, the message is sent at the next failed attempt.
+3. checkDEX tries to connect again after 30 s, then doubles the wait up to every 10 minutes. A temporary outage needs no action.
+4. Once connected, the usual startup message is sent (if `ENABLE_STARTUP_NOTIFICATION=true`) and monitoring starts.
+
+A configuration error does not fix itself: correct `.env` and run `docker compose up -d --force-recreate`.
+
+If no exchange is connected, no poll completes and the container shows `unhealthy`, but it keeps trying. An unexpected internal error stops the process instead of leaving it hanging, and Docker starts it again (`restart: unless-stopped`).
 
 ## Auto-start after server reboot
 
@@ -339,7 +382,18 @@ The container is running but the healthcheck fails. This means the polling loops
 
 1. Check logs for errors: `docker compose logs --tail=50 app`
 2. Look for `Error in orders loop`, `Error in positions loop`, or `Error in history loop`.
-3. Common causes: API authentication failure, network timeout, or Telegram error (see below).
+3. Look for `Exchange connection failed` — no exchange could connect (see [the next section](#exchange-connection-failed-in-telegram)).
+4. Common causes: API authentication failure, network timeout, or Telegram error (see below).
+
+### `exchange connection failed` in Telegram
+
+One exchange could not connect; the others keep running and checkDEX keeps retrying (see [When an exchange cannot connect](#when-an-exchange-cannot-connect)). The `Error:` line says why.
+
+| Error contains | Fix |
+|---|---|
+| `is an API (agent) wallet` | Set `HYPERLIQUID_WALLET_ADDRESS` to the main account address at the end of the message, then `docker compose up -d --force-recreate` |
+| `hyperliquid-python-sdk is not installed` | The image was built with an old `requirements.txt`. Copy the current one to the server, then `docker compose build --no-cache` and `docker compose up -d` |
+| `Name or service not known`, `Temporary failure in name resolution`, timeouts | Network or API outage — no action, checkDEX reconnects automatically |
 
 ### Telegram `400 Bad Request`
 

@@ -1,12 +1,18 @@
 """Unit tests for Telegram message formatting.
 
 Tests the format_* functions directly — no network calls, no bot token needed.
+Odeslani chybove zpravy o burze jde na lokalni testovaci server, ne na Telegram.
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
+
+from app.config import Config
 from app.models.events import (
     OrderFilledEvent,
     OrderOpenedEvent,
@@ -18,9 +24,12 @@ from app.models.events import (
 from app.models.order import Order, OrderSide, OrderStatus, OrderType
 from app.models.position import Position, PositionSide
 from app.models.trade import Trade
+from app.notifiers import telegram
 from app.notifiers.telegram import (
     ExchangePositions,
+    TelegramNotifier,
     format_daily_summary,
+    format_exchange_error,
     format_order_filled,
     format_order_opened,
     format_order_updated,
@@ -330,3 +339,81 @@ def test_all_formats_no_invalid_html() -> None:
     ]
     for msg in msgs:
         _no_invalid_tags(msg)
+
+
+# ---------------------------------------------------------------------------
+# Chyba pripojeni burzy
+# ---------------------------------------------------------------------------
+
+_TOKEN = "123456:SECRET-TOKEN"
+
+
+def test_exchange_error_message_escapes_html_and_truncates() -> None:
+    msg = format_exchange_error("Hyperliquid", "mainnet", "<Response [502]> " + "x" * 1000)
+    assert msg.startswith("⚠️ <b>checkDEX — exchange connection failed</b>")
+    assert "Exchange: Hyperliquid (mainnet)" in msg
+    assert "&lt;Response [502]&gt;" in msg
+    assert "<Response" not in msg
+    assert "x" * 1000 not in msg  # dlouhy text je zkraceny
+    _no_invalid_tags(msg)
+
+
+@pytest.fixture
+async def fake_send(monkeypatch):
+    """Lokalni server misto api.telegram.org/sendMessage.
+
+    Vraci (prijata tela requestu, HTTP stavy dalsich odpovedi — vychozi 200).
+    """
+    received: list[dict] = []
+    statuses: list[int] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        received.append(await request.json())
+        status = statuses.pop(0) if statuses else 200
+        return web.json_response({"ok": status == 200}, status=status)
+
+    app = web.Application()
+    app.router.add_post("/bot{token}/sendMessage", handler)
+    async with TestServer(app) as server:
+        url = f"http://{server.host}:{server.port}/bot{{token}}/sendMessage"
+        monkeypatch.setattr(telegram, "_API_URL", url)
+        yield received, statuses
+
+
+@pytest.fixture
+async def notifier():
+    config = Config(_env_file=None, telegram_bot_token=_TOKEN, telegram_chat_id="-1001")
+    # Chybova zprava se nededuplikuje, DB tedy neni potreba.
+    instance = TelegramNotifier(config, db=None)
+    await instance.connect()
+    yield instance
+    await instance.disconnect()
+
+
+async def test_send_exchange_error_posts_html_without_token(fake_send, notifier) -> None:
+    received, _ = fake_send
+    sent = await notifier.send_exchange_error("Hyperliquid", "mainnet", f"url /bot{_TOKEN}/x failed")
+
+    assert sent is True
+    body = received[0]
+    assert body["parse_mode"] == "HTML"
+    assert body["chat_id"] == "-1001"
+    assert "exchange connection failed" in body["text"]
+    assert _TOKEN not in body["text"]
+
+
+async def test_send_exchange_error_failure_returns_false_and_hides_token(
+    fake_send, notifier, caplog
+) -> None:
+    _, statuses = fake_send
+    statuses.append(400)
+
+    with caplog.at_level("WARNING"):
+        sent = await notifier.send_exchange_error("Hyperliquid", "mainnet", "boom")
+
+    assert sent is False
+    record = next(r for r in caplog.records if r.getMessage() == "Exchange error notification failed")
+    # Chyba aiohttp obsahuje URL s tokenem — v logu musi byt zamaskovany.
+    assert "400" in record.error
+    assert "***" in record.error
+    assert _TOKEN not in record.error

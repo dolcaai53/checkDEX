@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 _MAINNET_URL = "https://api.hyperliquid.xyz"
 _TESTNET_URL = "https://api.hyperliquid-testnet.xyz"
 
+# Casovy limit jednoho HTTP dotazu na Hyperliquid API. SDK sam zadny nenastavuje,
+# takze bez nej muze dotaz pri vypadku site viset donekonecna.
+_REQUEST_TIMEOUT_SECONDS = 15.0
+
 _HL_BUY = "B"
 _HL_SELL = "A"
 
@@ -137,6 +141,21 @@ def map_fill_to_trade(hl_fill: dict, exchange: str) -> Trade:
     )
 
 
+def parse_user_role(response: object) -> tuple[str | None, str | None]:
+    """Z odpovedi Hyperliquid userRole vrati (role, adresa hlavniho uctu).
+
+    Role je napr. "user" (bezny ucet), "agent" (API penezenka) nebo "missing"
+    (adresa, kterou Hyperliquid nezna). Adresu hlavniho uctu vraci API jen
+    u role "agent" v data.user.
+    """
+    if not isinstance(response, dict):
+        return None, None
+    role = response.get("role")
+    data = response.get("data")
+    main_account = data.get("user") if role == "agent" and isinstance(data, dict) else None
+    return (str(role) if role else None), (str(main_account) if main_account else None)
+
+
 async def _fills_by_time(info, address: str, start_ms: int) -> list[dict]:
     """Fetch fills since start_ms. Falls back to user_fills() if SDK lacks time filtering."""
     try:
@@ -150,7 +169,8 @@ class HyperliquidAdapter(ExchangeAdapter):
     """Exchange adapter for Hyperliquid DEX.
 
     Authentication: read-only endpoints require only a wallet address (0x…).
-    No private key is needed for monitoring.
+    No private key is needed for monitoring. It must be the main account, not an
+    API (agent) wallet — connect() checks this and names the main account.
 
     Sync SDK: hyperliquid-python-sdk uses synchronous requests internally. All
     SDK calls are dispatched via asyncio.to_thread() to avoid blocking the loop.
@@ -185,11 +205,60 @@ class HyperliquidAdapter(ExchangeAdapter):
             ) from exc
 
         base_url = _TESTNET_URL if self._config.hyperliquid_testnet else _MAINNET_URL
-        self._info = Info(base_url, skip_ws=True)
+        try:
+            # Konstruktor Info stahuje metadata trhu blokujicim HTTP — proto ve vlakne.
+            info = await asyncio.to_thread(
+                Info, base_url, skip_ws=True, timeout=_REQUEST_TIMEOUT_SECONDS
+            )
+        except Exception as exc:
+            raise ExchangeConnectionError(f"Hyperliquid client init failed: {exc}") from exc
+
+        await self._check_wallet_role(info)
+        self._info = info
         logger.info(
             "Hyperliquid adapter initialised",
             extra={"network": "testnet" if self._config.hyperliquid_testnet else "mainnet"},
         )
+
+    async def _check_wallet_role(self, info) -> None:
+        """Odmitne API (agent) penezenku v HYPERLIQUID_WALLET_ADDRESS.
+
+        API penezenka nema vlastni pozice ani ordery — patri hlavnimu uctu,
+        takze by monitoring nic nevidel. Chyba rovnou uvede adresu hlavniho uctu.
+        Kdyz se roli nepodari zjistit, jen se zaloguje varovani a monitoring
+        pokracuje (kontrola nesmi zablokovat jinak funkcni pripojeni).
+        """
+        address = self._address()
+        try:
+            response = await asyncio.to_thread(
+                info.post, "/info", {"type": "userRole", "user": address}
+            )
+        except Exception as exc:
+            logger.warning(
+                "Hyperliquid wallet role check failed, continuing",
+                extra={"address": address, "error": str(exc)},
+            )
+            return
+
+        role, main_account = parse_user_role(response)
+        logger.info("Hyperliquid wallet role", extra={"address": address, "role": role})
+        if role == "agent":
+            # Adresa az na konci a bez tecky, aby sla z Telegramu primo zkopirovat.
+            fix = (
+                f"Set HYPERLIQUID_WALLET_ADDRESS to the main account address: {main_account}"
+                if main_account
+                else "Set HYPERLIQUID_WALLET_ADDRESS to the main account address shown on hyperliquid.xyz"
+            )
+            raise ExchangeConnectionError(
+                f"HYPERLIQUID_WALLET_ADDRESS {address} is an API (agent) wallet "
+                f"without positions or orders of its own. {fix}"
+            )
+        if role == "missing":
+            logger.warning(
+                "Hyperliquid does not know HYPERLIQUID_WALLET_ADDRESS (no account activity), "
+                "check the address",
+                extra={"address": address},
+            )
 
     async def disconnect(self) -> None:
         self._info = None

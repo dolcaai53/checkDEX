@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Union
 
 from app.models.events import (
@@ -132,14 +133,16 @@ class EventEngine:
     ) -> list[OrderEvent]:
         """Diff current open orders against stored snapshot. Update snapshot."""
         previous = await self._db.get_order_snapshots(exchange)
+        marker = f"orders_initialized:{exchange}"
 
-        if not previous:
+        if await self._is_first_run(marker, has_snapshot=bool(previous)):
             # First run — populate snapshot silently; no notifications for pre-existing orders
             logger.info(
                 "First run: populating order snapshot silently",
                 extra={"exchange": exchange, "count": len(current)},
             )
             await self._db.replace_order_snapshots(exchange, current)
+            await self._mark_initialized(marker)
             return []
 
         events, to_mark_pending = detect_order_events(previous, current, history)
@@ -198,13 +201,15 @@ class EventEngine:
     ) -> list[PositionEvent]:
         """Diff current positions against stored snapshot. Update snapshot."""
         previous = await self._db.get_position_snapshots(exchange)
+        marker = f"positions_initialized:{exchange}"
 
-        if not previous:
+        if await self._is_first_run(marker, has_snapshot=bool(previous)):
             logger.info(
                 "First run: populating position snapshot silently",
                 extra={"exchange": exchange, "count": len(current)},
             )
             await self._db.replace_position_snapshots(exchange, current)
+            await self._mark_initialized(marker)
             return []
 
         events = detect_position_events(previous, current)
@@ -216,10 +221,63 @@ class EventEngine:
         exchange: str,
         recent_history: list[Trade],
     ) -> list[PositionClosedEvent]:
-        """Detect newly closed positions from history. Skips already-notified trades."""
+        """Detect newly closed positions from history. Skips already-notified trades.
+
+        Prvni beh pro burzu (i nove pridanou) obchody z historie jen potichu
+        oznaci jako odeslane — jinak by prisla serie starych POSITION CLOSED.
+        """
+        if await self._is_first_history_run(exchange):
+            logger.info(
+                "First run: marking closed positions from history as notified silently",
+                extra={"exchange": exchange, "count": len(recent_history)},
+            )
+            await self._db.mark_notified_many(
+                [f"position_closed:{exchange}:{trade.id}" for trade in recent_history]
+            )
+            await self._mark_initialized(f"history_initialized:{exchange}")
+            return []
+
         events: list[PositionClosedEvent] = []
         for trade in recent_history:
             nid = f"position_closed:{exchange}:{trade.id}"
             if not await self._db.is_notified(nid):
                 events.append(PositionClosedEvent(trade=trade))
         return events
+
+    # ------------------------------------------------------------------
+    # Znacky prvniho behu (ulozene v history_cursors)
+    # ------------------------------------------------------------------
+
+    async def _is_first_run(self, marker: str, has_snapshot: bool) -> bool:
+        """True, dokud pro snapshot neprobehl prvni (tichy) beh.
+
+        Znacka v DB odlisi prvni spusteni od uctu, ktery je jen prazdny — jinak
+        by se prvni order nebo pozice na prazdnem uctu spolkla bez notifikace.
+        Starsi verze znacku neukladala: neprazdny snapshot znamena, ze prvni
+        beh uz probehl, a znacka se jen doplni.
+        """
+        if await self._db.get_cursor(marker) is not None:
+            return False
+        if has_snapshot:
+            await self._mark_initialized(marker)
+            return False
+        return True
+
+    async def _is_first_history_run(self, exchange: str) -> bool:
+        """True, dokud pro historii burzy neprobehl prvni (tichy) beh.
+
+        Vlastni znacka, protoze smycky orders/positions/history bezi soubezne —
+        snapshoty nic nereknou o tom, jestli uz se zpracovala historie.
+        """
+        marker = f"history_initialized:{exchange}"
+        if await self._db.get_cursor(marker) is not None:
+            return False
+        # Starsi verze znacku neukladala. Uz odeslana close notifikace znamena,
+        # ze se historie burzy sleduje — nove obchody se nesmi potichu spolknout.
+        if await self._db.has_notification_with_prefix(f"position_closed:{exchange}:"):
+            await self._mark_initialized(marker)
+            return False
+        return True
+
+    async def _mark_initialized(self, marker: str) -> None:
+        await self._db.set_cursor(marker, datetime.now(timezone.utc).isoformat())
