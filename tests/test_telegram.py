@@ -19,6 +19,7 @@ from app.models.order import Order, OrderSide, OrderStatus, OrderType
 from app.models.position import Position, PositionSide
 from app.models.trade import Trade
 from app.notifiers.telegram import (
+    ExchangePositions,
     format_daily_summary,
     format_order_filled,
     format_order_opened,
@@ -26,6 +27,7 @@ from app.notifiers.telegram import (
     format_position_closed,
     format_position_opened,
     format_position_updated,
+    format_positions_report,
 )
 
 _TS = datetime(2026, 5, 7, 13, 42, 11, tzinfo=timezone.utc)
@@ -263,6 +265,52 @@ def test_daily_summary_total_upnl_sums_multiple() -> None:
 
 def test_daily_summary_no_invalid_html() -> None:
     _no_invalid_tags(format_daily_summary("Extended", "mainnet", [_position()]))
+
+
+def test_daily_summary_layout() -> None:
+    lines = format_daily_summary("Extended", "mainnet", [_position()]).split("\n")
+    assert lines[:2] == ["📊 <b>DAILY POSITION SUMMARY</b>", "Exchange: Extended (mainnet)"]
+    # lines[2] je aktualni cas
+    assert lines[3:] == [
+        "",
+        "<b>BTC-USD</b> LONG 10x",
+        "  Size: 0.25 | Entry: 63250.50",
+        "  Mark: 63500.00 | uPnL: +62.38 USDC",
+        "",
+        "─────────────────────",
+        "Total uPnL: <b>+62.38 USDC</b>",
+        "Open positions: 1",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# /positions — odpoved na prikaz
+# ---------------------------------------------------------------------------
+
+def test_positions_report_lists_all_exchanges() -> None:
+    msg = format_positions_report([
+        ExchangePositions("Extended", "mainnet", [_position()]),
+        ExchangePositions("Hyperliquid", "mainnet", []),
+    ])
+    assert msg.startswith("📊 <b>OPEN POSITIONS</b>")
+    assert "Exchange: Extended (mainnet)" in msg
+    assert "<b>BTC-USD</b> LONG 10x" in msg
+    assert "Total uPnL: <b>+62.38 USDC</b>" in msg
+    assert "Exchange: Hyperliquid (mainnet)" in msg
+    assert "No open positions." in msg
+
+
+def test_positions_report_marks_unavailable_exchange() -> None:
+    msg = format_positions_report([ExchangePositions("Hyperliquid", "mainnet", None)])
+    assert "Exchange: Hyperliquid (mainnet)" in msg
+    assert "Data unavailable" in msg
+    assert "No open positions." not in msg
+
+
+def test_positions_report_no_invalid_html() -> None:
+    _no_invalid_tags(
+        format_positions_report([ExchangePositions("Extended", "mainnet", [_position()])])
+    )
 
 
 # ---------------------------------------------------------------------------

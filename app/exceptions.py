@@ -15,3 +15,7 @@ class ExchangeConnectionError(CheckDEXError):
 
 class ExchangeRateLimitError(CheckDEXError):
     """Exchange rate limit exceeded (HTTP 429)."""
+
+
+class TelegramAPIError(CheckDEXError):
+    """Telegram Bot API vratilo ok=false (text chyby neobsahuje bot token)."""

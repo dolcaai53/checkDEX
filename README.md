@@ -8,6 +8,7 @@ Read-only trading monitor for decentralised exchanges. Watches your account on E
 - Monitors open positions and size changes.
 - Detects closed positions with realised PnL (profit / loss / breakeven).
 - Sends all events as HTML-formatted messages to a Telegram chat.
+- Answers the `/positions` command in the Telegram chat with the current open positions (see [Telegram commands](#telegram-commands)).
 - Deduplicates notifications so the same event is never sent twice, even after a restart.
 - Designed from the start for multi-exchange extensibility (Lighter, Hyperliquid, etc.).
 
@@ -28,6 +29,7 @@ app/
   services/
     event_engine.py     — pure diff functions + EventEngine orchestrator
     monitor.py          — three independent polling loops
+    commands.py         — Telegram chat commands (/positions) via long polling
   notifiers/
     telegram.py         — Telegram Bot API notifier with dedup and retry
   storage/
@@ -36,7 +38,7 @@ app/
     pnl.py              — PnL calculation and formatting
     retry.py            — exponential backoff retry helper
     logging.py          — structured JSON logging setup
-tests/                  — pytest test suite (83 tests, no network required)
+tests/                  — pytest test suite (126 tests, no network required)
 ```
 
 ## Extended Exchange integration
@@ -78,6 +80,29 @@ The Extended SDK uses cursor-based pagination with no time-based filtering. chec
 3. Get the chat ID: send a message, then open `https://api.telegram.org/bot<TOKEN>/getUpdates` and find `"chat":{"id":…}`.
 4. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in your `.env`.
 
+While checkDEX is running it reads the bot's updates itself (see [Telegram commands](#telegram-commands)), so the `getUpdates` page in step 3 may show an empty list. Stop the container first (`docker compose stop`), send a new message to the chat, then open the page.
+
+## Telegram commands
+
+Besides sending notifications, the bot answers commands sent in the chat:
+
+| Command | Reply |
+|---|---|
+| `/positions` | Current open positions on all monitored exchanges — market, side, leverage, size, entry, mark, unrealized PnL and total unrealized PnL |
+
+How it works:
+
+- checkDEX asks Telegram for new messages with long polling (`getUpdates`). No webhook and no open port are needed.
+- Positions are fetched fresh from the exchange API when the command arrives, not from the local snapshot. If an exchange cannot be reached, its section says `Data unavailable` and the other exchanges are still listed.
+- Only messages from `TELEGRAM_CHAT_ID` are answered; any other chat is ignored. In a group, every member of the group can use the command.
+- In a group, send `/positions@YourBotName`. A plain `/positions` reaches the bot only if it was the last bot to post in the group (Telegram privacy mode, on by default).
+- Commands older than 5 minutes (e.g. sent while the container was down) are ignored, so a restart does not trigger a burst of replies. The ID of the last processed message is stored in the database (`history_cursors`), so no command is answered twice.
+- Several `/positions` received at once get a single reply.
+- The command is read-only — it never changes anything on the exchange.
+- Disable it with `ENABLE_TELEGRAM_COMMANDS=false`.
+
+**One reader per bot token:** Telegram hands out updates to only one reader at a time. If another program reads updates of the same bot token, or a webhook is set for it, Telegram answers with `409 Conflict` and `/positions` gets no reply (notifications keep working). Give the other program its own bot, or set `ENABLE_TELEGRAM_COMMANDS=false`.
+
 ## Configuration
 
 Copy `.env.example` to `.env` and fill in your values:
@@ -99,6 +124,7 @@ Key variables:
 | `EXTENDED_NETWORK` | `mainnet` | `mainnet` or `testnet` |
 | `TELEGRAM_BOT_TOKEN` | — | Required |
 | `TELEGRAM_CHAT_ID` | — | Required |
+| `ENABLE_TELEGRAM_COMMANDS` | `true` | Answer `/positions` in `TELEGRAM_CHAT_ID` (see [Telegram commands](#telegram-commands)) |
 | `POLL_INTERVAL_ORDERS_SECONDS` | `60` | Orders polling interval |
 | `POLL_INTERVAL_POSITIONS_SECONDS` | `60` | Positions polling interval |
 | `POLL_INTERVAL_HISTORY_SECONDS` | `60` | History polling interval |
@@ -342,6 +368,17 @@ After updating `.env`, restart the container:
 ```bash
 docker compose up -d
 ```
+
+### `/positions` gets no reply
+
+1. Check that `ENABLE_TELEGRAM_COMMANDS` is not set to `false`.
+2. In a group, send `/positions@YourBotName` (see [Telegram commands](#telegram-commands)).
+3. The command must be sent in the chat set in `TELEGRAM_CHAT_ID`; other chats are ignored.
+4. Look for `Telegram command handling failed` in the logs:
+   ```bash
+   docker compose logs --tail=200 app | grep "Telegram command"
+   ```
+   A `409` error means another program reads updates of the same bot token, or a webhook is set for it. Give the other program its own bot, or disable the command.
 
 ### Bot token exposed in logs
 

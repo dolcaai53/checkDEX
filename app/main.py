@@ -9,6 +9,7 @@ from app.exchanges.base import ExchangeAdapter
 from app.exchanges.extended import ExtendedAdapter
 from app.exchanges.hyperliquid import HyperliquidAdapter
 from app.notifiers.telegram import TelegramNotifier
+from app.services.commands import TelegramCommandListener
 from app.services.monitor import Monitor
 from app.storage.database import Database
 from app.utils.logging import setup_logging
@@ -53,10 +54,19 @@ async def main() -> None:
 
     _monitors = [Monitor(config, ex, db, notifier) for ex in exchanges]
 
+    listener_task: asyncio.Task[None] | None = None
+    if config.enable_telegram_commands:
+        listener = TelegramCommandListener(config, db, notifier, exchanges)
+        listener_task = asyncio.create_task(listener.run(), name="telegram_commands")
+
     try:
         await asyncio.gather(*[m.run() for m in _monitors])
     finally:
         logger.info("Shutting down components...")
+        # Listener nema co dokoncovat — zrusit ho driv, nez se zavre session a DB.
+        if listener_task is not None:
+            listener_task.cancel()
+            await asyncio.gather(listener_task, return_exceptions=True)
         await notifier.disconnect()
         for exchange in exchanges:
             await exchange.disconnect()

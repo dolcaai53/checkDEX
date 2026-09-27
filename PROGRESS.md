@@ -2,7 +2,7 @@
 
 ## Stav projektu
 
-**Aktuální stav:** ✅ Projekt běží v produkci na mainnetu — Fáze 1–7 hotové, 83 testů prochází, runtime opravy ověřeny live
+**Aktualni stav:** ✅ Projekt bezi v produkci na mainnetu (Extended) — Faze 1–7 hotove, runtime opravy overeny live. Pozdeji pridano: denni souhrn pozic, Hyperliquid adapter, vice DEXu soucasne, Telegram prikaz /positions — 126 testu prochazi. Nasazeni techto novych funkci na server neovereno.
 
 ---
 
@@ -61,18 +61,40 @@
 - `git init`, initial commit (40 souborů, 3614 řádků)
 - Push na https://github.com/dolcaai53/checkDEX.git (branch: main)
 
+### Denni souhrn pozic ✅ (2026-05-07, commit 355d567)
+- `ENABLE_DAILY_SUMMARY`, `DAILY_SUMMARY_TIME` — jednou denne zprava 📊 DAILY POSITION SUMMARY
+
+### Hyperliquid adapter ✅ (2026-05-12, commit 169c9f1)
+- `app/exchanges/hyperliquid.py` — read-only pres `hyperliquid-python-sdk` (`Info`), staci `HYPERLIQUID_WALLET_ADDRESS`, zadny privatni klic
+- 18 unit testu v `tests/test_hyperliquid.py`
+
+### Vice DEXu soucasne ✅ (2026-05-12, commit 2f235b2)
+- `ACTIVE_EXCHANGES=extended,hyperliquid` — pro kazdou burzu vlastni Monitor, spolecna DB a Telegram notifier
+
+### Telegram prikaz /positions ✅ (2026-09-27)
+- `app/services/commands.py` — `TelegramCommandListener`: long polling `getUpdates`, zadny webhook ani otevreny port
+- `/positions` (ve skupine `/positions@JmenoBota`) posle aktualni pozice vsech sledovanych burz, data primo z API burzy
+- Odpovida jen v chatu `TELEGRAM_CHAT_ID`; prikazy starsi nez 5 min se ignoruji; offset v `history_cursors`, takze po restartu zadna dvojita odpoved
+- Burza, ktera neodpovi, je ve zprave oznacena "Data unavailable" — ostatni se vypisou
+- Bot token se v logu listeneru maskuje (`bot***`)
+- `ENABLE_TELEGRAM_COMMANDS=true` (vychozi); `false` = vypnuto
+- Denni souhrn a /positions sdili formatovani pozic (`_position_lines`)
+- 17 testu v `tests/test_commands.py`, 4 nove testy v `tests/test_telegram.py` (vcetne kontroly, ze se vzhled denniho souhrnu nezmenil)
+
 ---
 
 ## Testovací výsledky
 
 ```
-83 passed in 0.97s
+126 passed in 1.29s   (2026-09-27, v Dockeru)
 ```
 
-- tests/test_event_engine.py — 28 testů (mapping + detekce)
-- tests/test_pnl.py — 16 testů
-- tests/test_storage.py — 20 testů
-- tests/test_telegram.py — 19 testů
+- tests/test_commands.py — 17 testu (/positions, getUpdates)
+- tests/test_event_engine.py — 28 testu (mapping + detekce)
+- tests/test_hyperliquid.py — 18 testu
+- tests/test_pnl.py — 16 testu
+- tests/test_storage.py — 21 testu
+- tests/test_telegram.py — 26 testu
 
 ---
 

@@ -3,10 +3,12 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import NamedTuple
 
 import aiohttp
 
 from app.config import Config
+from app.exceptions import TelegramAPIError
 from app.models.events import (
     OrderFilledEvent,
     OrderOpenedEvent,
@@ -23,7 +25,15 @@ from app.utils.retry import with_retry
 logger = logging.getLogger(__name__)
 
 _API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+_UPDATES_URL = "https://api.telegram.org/bot{token}/getUpdates"
 
+
+class ExchangePositions(NamedTuple):
+    """Pozice jedne burzy pro odpoved na /positions."""
+
+    exchange: str
+    network: str
+    positions: list[Position] | None  # None = data se nepodarilo nacist
 
 
 def _utc(dt: datetime | None) -> str:
@@ -164,6 +174,29 @@ def format_position_closed(event: PositionClosedEvent) -> str:
     return "\n".join(lines)
 
 
+def _position_lines(positions: list[Position]) -> list[str]:
+    """Radky s pozicemi a souctem uPnL — spolecne pro denni souhrn a /positions."""
+    if not positions:
+        return ["No open positions."]
+    lines: list[str] = []
+    total_upnl: Decimal | None = None
+    for p in positions:
+        mark = f"{p.mark_price:.2f}" if p.mark_price else "—"
+        upnl_str = fmt_pnl(p.unrealized_pnl) if p.unrealized_pnl is not None else "—"
+        leverage = f" {p.leverage}x" if p.leverage else ""
+        lines.append(f"<b>{p.market}</b> {p.side}{leverage}")
+        lines.append(f"  Size: {p.size} | Entry: {p.entry_price:.2f}")
+        lines.append(f"  Mark: {mark} | uPnL: {upnl_str}")
+        lines.append("")
+        if p.unrealized_pnl is not None:
+            total_upnl = p.unrealized_pnl if total_upnl is None else total_upnl + p.unrealized_pnl
+    lines.append("─────────────────────")
+    if total_upnl is not None:
+        lines.append(f"Total uPnL: <b>{fmt_pnl(total_upnl)}</b>")
+    lines.append(f"Open positions: {len(positions)}")
+    return lines
+
+
 def format_daily_summary(exchange: str, network: str, positions: list[Position]) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     lines = [
@@ -172,24 +205,20 @@ def format_daily_summary(exchange: str, network: str, positions: list[Position])
         now,
         "",
     ]
-    if not positions:
-        lines.append("No open positions.")
-    else:
-        total_upnl: Decimal | None = None
-        for p in positions:
-            mark = f"{p.mark_price:.2f}" if p.mark_price else "—"
-            upnl_str = fmt_pnl(p.unrealized_pnl) if p.unrealized_pnl is not None else "—"
-            leverage = f" {p.leverage}x" if p.leverage else ""
-            lines.append(f"<b>{p.market}</b> {p.side}{leverage}")
-            lines.append(f"  Size: {p.size} | Entry: {p.entry_price:.2f}")
-            lines.append(f"  Mark: {mark} | uPnL: {upnl_str}")
-            lines.append("")
-            if p.unrealized_pnl is not None:
-                total_upnl = p.unrealized_pnl if total_upnl is None else total_upnl + p.unrealized_pnl
-        lines.append("─────────────────────")
-        if total_upnl is not None:
-            lines.append(f"Total uPnL: <b>{fmt_pnl(total_upnl)}</b>")
-        lines.append(f"Open positions: {len(positions)}")
+    lines += _position_lines(positions)
+    return "\n".join(lines)
+
+
+def format_positions_report(sections: list[ExchangePositions]) -> str:
+    """Odpoved na prikaz /positions — aktualni pozice vsech sledovanych burz."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    lines = ["📊 <b>OPEN POSITIONS</b>", now]
+    for section in sections:
+        lines += ["", f"Exchange: {section.exchange} ({section.network})"]
+        if section.positions is None:
+            lines.append("⚠️ Data unavailable (exchange API error)")
+        else:
+            lines += _position_lines(section.positions)
     return "\n".join(lines)
 
 
@@ -302,3 +331,33 @@ class TelegramNotifier:
         nid = f"daily_summary:{exchange}:{date_str}"
         text = format_daily_summary(exchange, network, positions)
         await self._send(text, nid)
+
+    async def send_positions_report(self, sections: list[ExchangePositions]) -> None:
+        """Odpoved na /positions — bez deduplikace, kazdy dotaz dostane odpoved."""
+        text = format_positions_report(sections)
+        await with_retry(lambda: self._post(text), label="telegram:positions_report")
+        logger.info("Positions report sent", extra={"exchanges": len(sections)})
+
+    # ------------------------------------------------------------------
+    # Prichozi zpravy (prikazy v chatu)
+    # ------------------------------------------------------------------
+
+    async def get_updates(self, offset: int | None, timeout: int) -> list[dict]:
+        """Long polling: ceka az *timeout* sekund na nove zpravy pro bota.
+
+        Pri odpovedi ok=false (napr. 409 — bot ma webhook nebo ho cte jiny
+        proces) vyhodi TelegramAPIError.
+        """
+        payload: dict = {"timeout": timeout, "allowed_updates": ["message", "channel_post"]}
+        if offset is not None:
+            payload["offset"] = offset
+        url = _UPDATES_URL.format(token=self._config.telegram_bot_token)
+        async with self._session_or_raise().post(
+            url,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=timeout + 15),
+        ) as resp:
+            data = await resp.json(content_type=None)
+        if not data.get("ok"):
+            raise TelegramAPIError(f"{data.get('error_code')}: {data.get('description')}")
+        return data.get("result") or []

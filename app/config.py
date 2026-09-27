@@ -31,6 +31,8 @@ class Config(BaseSettings):
     # Telegram
     telegram_bot_token: str
     telegram_chat_id: str
+    # Prikazy v chatu (/positions) pres getUpdates long polling
+    enable_telegram_commands: bool = True
 
     # Polling intervals per endpoint group
     poll_interval_orders_seconds: int = Field(default=60, ge=1)
