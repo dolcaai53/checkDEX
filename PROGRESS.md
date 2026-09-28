@@ -2,7 +2,7 @@
 
 ## Stav projektu
 
-**Aktualni stav:** ✅ Projekt bezi v produkci na mainnetu (Extended) — Faze 1–7 hotove, runtime opravy overeny live. Pozdeji pridano: denni souhrn pozic, Hyperliquid adapter, vice DEXu soucasne, Telegram prikaz /positions, mark cena u Hyperliquid pozic, posledni cena (Last) u pozic a presnost cen — 232 testu prochazi. Nasazeni techto novych funkci na server neovereno.
+**Aktualni stav:** ✅ Projekt bezi v produkci na mainnetu (Extended) — Faze 1–7 hotove, runtime opravy overeny live. Pozdeji pridano: denni souhrn pozic, Hyperliquid adapter, vice DEXu soucasne, Telegram prikaz /positions, mark cena u Hyperliquid pozic, posledni cena (Last) u pozic a presnost cen, casove limity a opakovani dotazu na Extended — 239 testu prochazi. Nasazeni techto novych funkci na server neovereno.
 
 ---
 
@@ -111,18 +111,25 @@
 - Overeno proti skutecnemu API: Extended `lastPrice` odpovida poslednimu verejnemu obchodu, Hyperliquid zaviraci cena svicky = posledni obchod (`recentTrades`); Extended ucet mel pri overeni zadne otevrene pozice — cesta s pozicemi overena unit testy
 - Nove testy: `tests/test_extended.py` (10), dalsi v hyperliquid (13), telegram (16), event_engine (1)
 
+### Casove limity a opakovani dotazu Extended + README o vice burzach ✅ (2026-09-28)
+- Vsechny dotazy na Extended (pres SDK i prime) maji limit 15 s (`_REQUEST_TIMEOUT` na session) — vychozi limit SDK je 500 s, zaseknuty dotaz by na minuty zastavil sledovani
+- `get_orders_history` (primy HTTP dotaz) ted opakuje pri vyprseni limitu nebo chybe site (`with_retry`), stejne jako ostatni dotazy
+- Vsechny metody adapteru prevedou po vycerpani pokusu sit, vyprseni limitu i chyby SDK na `ExchangeConnectionError` (`_API_ERRORS`) — drive `asyncio.TimeoutError` prosel bez zachyceni
+- README: projekt popsan jako Extended + Hyperliquid, sekce "Adding another exchange" (Lighter), poznamka o limitu a opakovani u Extended
+- 7 novych testu v `tests/test_extended.py`; na puvodnim kodu vsech 7 selze
+
 ---
 
 ## Testovací výsledky
 
 ```
-232 passed, 1 warning   (2026-09-28, v Dockeru; warning = DeprecationWarning z python-json-logger)
+239 passed, 1 warning   (2026-09-28, v Dockeru; warning = DeprecationWarning z python-json-logger)
 ```
 
 - tests/test_commands.py — 17 testu (/positions, getUpdates)
 - tests/test_config.py — 13 testu (ACTIVE_EXCHANGES carka/JSON, .env.example)
 - tests/test_event_engine.py — 38 testu (mapping + detekce + prvni spusteni)
-- tests/test_extended.py — 10 testu (posledni ceny z /info/markets)
+- tests/test_extended.py — 17 testu (posledni ceny z /info/markets, casovy limit a opakovani dotazu)
 - tests/test_hyperliquid.py — 60 testu (mapping + connect, kontrola API penezenky, mark a posledni ceny)
 - tests/test_main.py — 8 testu (opakovani pripojeni, nezavislost burz, uklid)
 - tests/test_pnl.py — 16 testu

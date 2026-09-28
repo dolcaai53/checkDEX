@@ -1,6 +1,6 @@
 # checkDEX
 
-Read-only trading monitor for decentralised exchanges. Watches your account on Extended Exchange, detects order and position events, and sends formatted Telegram notifications.
+Read-only trading monitor for decentralised exchanges. Watches your accounts on Extended Exchange and Hyperliquid, detects order and position events, and sends formatted Telegram notifications.
 
 ## What it does
 
@@ -10,7 +10,7 @@ Read-only trading monitor for decentralised exchanges. Watches your account on E
 - Sends all events as HTML-formatted messages to a Telegram chat.
 - Answers the `/positions` command in the Telegram chat with the current open positions (see [Telegram commands](#telegram-commands)).
 - Deduplicates notifications so the same event is never sent twice, even after a restart.
-- Designed from the start for multi-exchange extensibility (Lighter, Hyperliquid, etc.).
+- Monitors Extended and Hyperliquid, one or both at once (`ACTIVE_EXCHANGES`). More exchanges (e.g. Lighter) can be added as adapters (see [Adding another exchange](#adding-another-exchange)).
 
 ## Architecture
 
@@ -21,6 +21,7 @@ app/
   exchanges/
     base.py             — ExchangeAdapter ABC (multi-exchange interface)
     extended.py         — Extended Exchange implementation
+    hyperliquid.py      — Hyperliquid implementation (wallet address only, no keys)
   models/
     order.py            — Order model and enums
     position.py         — Position model and enums
@@ -56,6 +57,8 @@ Authentication uses the official [x10-python-trading](https://github.com/x10xcha
 `EXTENDED_PRIVATE_KEY` and `EXTENDED_PUBLIC_KEY` are passed to the SDK initialiser but never used for signing — this is a read-only system.
 
 **API endpoint note:** The SDK ships with an outdated base URL (`api.extended.exchange`). checkDEX automatically patches it to the current endpoint `api.starknet.extended.exchange` at startup — no manual change is needed.
+
+**Timeouts and retries:** every Extended request has a 15-second timeout (the SDK default is 500 s), so a stuck request cannot block the monitor. Account data requests that time out or hit a network error are retried up to 3 times (after 1, 2 and 4 s). If all attempts fail, the error is logged and the next poll tries again.
 
 ### Polling mode
 
@@ -281,14 +284,17 @@ If an order vanishes from `get_open_orders()` and is not yet in `get_orders_hist
 - **Polling only** — no WebSocket layer. Minimum detection latency equals the poll interval (default 60 s).
 - **PnL % is approximate** — does not include leverage, fees, or funding rate.
 - **Extended SDK cursor pagination** — the history endpoint returns the most recent 50 records. Very high-frequency trading (>50 events per poll interval) could cause missed events.
-- **Single exchange** — only Extended Exchange is implemented. The adapter interface is ready for Lighter and Hyperliquid.
+- **Two exchanges** — Extended and Hyperliquid are implemented, Lighter is not yet (see [Adding another exchange](#adding-another-exchange)).
 - **No POSITION_UPDATED on unrealized PnL** — only size changes trigger `POSITION UPDATED` notifications, preventing spam from mark price fluctuations.
 
-## Adding Lighter or Hyperliquid
+## Adding another exchange
 
-1. Create `app/exchanges/lighter.py` (or `hyperliquid.py`) implementing `ExchangeAdapter`.
+Lighter or any other exchange is added as a new adapter, the same way as Hyperliquid:
+
+1. Create `app/exchanges/lighter.py` with a class implementing `ExchangeAdapter` (`app/exchanges/base.py`). `extended.py` and `hyperliquid.py` are working examples.
 2. Translate the exchange's native order/position/trade objects into the internal models (`Order`, `Position`, `Trade`).
-3. Instantiate the new adapter in `app/main.py` alongside (or instead of) `ExtendedAdapter`.
+3. In `app/config.py`, add the exchange ID (e.g. `lighter`) to the valid `ACTIVE_EXCHANGES` values, add its settings and check the required ones. Describe the new variables in `.env.example`.
+4. In `app/main.py`, return the new adapter from `_create_exchange_adapter` for that ID.
 
 No changes to `EventEngine`, `Monitor`, `TelegramNotifier`, or `Database` are needed.
 

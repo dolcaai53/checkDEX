@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -16,7 +17,7 @@ from x10.perpetual.orders import OrderSide as SdkOrderSide
 from x10.perpetual.positions import PositionHistoryModel, PositionModel
 from x10.perpetual.trading_client.trading_client import PerpetualTradingClient
 from x10.perpetual.trades import AccountTradeModel
-from x10.utils.http import CLIENT_TIMEOUT, ResponseStatus, WrappedApiResponse
+from x10.utils.http import ResponseStatus, WrappedApiResponse
 
 from app.config import Config
 from app.exceptions import ExchangeAPIError, ExchangeConnectionError
@@ -32,9 +33,14 @@ logger = logging.getLogger(__name__)
 # under normal trading conditions. Increase if many events per minute are expected.
 _HISTORY_FETCH_LIMIT = 50
 
-# Posledni cena je ve zpravach jen informativni — jeji dotaz nesmi zdrzet sledovani
-# pozic tak dlouho jako vychozi limit SDK (CLIENT_TIMEOUT, 500 s).
-_LAST_PRICE_TIMEOUT = aiohttp.ClientTimeout(total=15)
+# Limit na jeden dotaz na Extended (pres SDK i primy HTTP dotaz). Vychozi limit SDK
+# (CLIENT_TIMEOUT) je 500 s — zaseknuty dotaz by na minuty zastavil sledovani.
+# Hyperliquid adapter ma stejny limit.
+_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+# Chyby, ktere po vycerpani opakovani (with_retry) znamenaji nedostupne API:
+# sit, vyprseni _REQUEST_TIMEOUT a chyby SDK (napr. HTTP 401 nebo 429).
+_API_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError, X10Error)
 
 # String-keyed maps — pydantic v2 with StrEnum stores the string value in model
 # fields, so sdk_model.status returns "NEW" not SdkOrderStatus.NEW.
@@ -253,7 +259,7 @@ class ExtendedAdapter(ExchangeAdapter):
                 "X-Api-Key": self._config.extended_api_key,
                 "Accept": "application/json",
             },
-            timeout=CLIENT_TIMEOUT,
+            timeout=_REQUEST_TIMEOUT,
         )
         self._client.account._BaseModule__session = self._session
 
@@ -280,8 +286,8 @@ class ExtendedAdapter(ExchangeAdapter):
                 lambda: client.account.get_open_orders(),
                 label="get_open_orders",
             )
-        except (aiohttp.ClientError, X10Error) as exc:
-            raise ExchangeConnectionError(f"get_open_orders failed: {exc}") from exc
+        except _API_ERRORS as exc:
+            raise ExchangeConnectionError(f"get_open_orders failed: {type(exc).__name__}: {exc}") from exc
 
         data = _unwrap(response, "get_open_orders")
         orders = [map_order(o, self.exchange_name) for o in data]
@@ -295,8 +301,8 @@ class ExtendedAdapter(ExchangeAdapter):
                 lambda: client.account.get_positions(),
                 label="get_positions",
             )
-        except (aiohttp.ClientError, X10Error) as exc:
-            raise ExchangeConnectionError(f"get_positions failed: {exc}") from exc
+        except _API_ERRORS as exc:
+            raise ExchangeConnectionError(f"get_positions failed: {type(exc).__name__}: {exc}") from exc
 
         data = _unwrap(response, "get_positions")
         # Posledni ceny se nacitaji jen kdyz jsou otevrene pozice — jinak neni co doplnit.
@@ -314,7 +320,7 @@ class ExtendedAdapter(ExchangeAdapter):
         url = f"{self._api_base_url}/info/markets"
         params = [("market", market) for market in sorted(set(markets))]
         try:
-            async with self._session.get(url, params=params, timeout=_LAST_PRICE_TIMEOUT) as resp:
+            async with self._session.get(url, params=params) as resp:
                 resp.raise_for_status()
                 payload = await resp.json()
         except Exception as exc:
@@ -341,12 +347,15 @@ class ExtendedAdapter(ExchangeAdapter):
         url = f"{self._api_base_url}/user/orders/history"
         params = {"limit": str(_HISTORY_FETCH_LIMIT)}
 
-        try:
+        async def fetch() -> dict:
             async with self._session.get(url, params=params) as resp:
                 resp.raise_for_status()
-                payload = await resp.json()
-        except aiohttp.ClientError as exc:
-            raise ExchangeConnectionError(f"get_orders_history failed: {exc}") from exc
+                return await resp.json()
+
+        try:
+            payload = await with_retry(fetch, label="get_orders_history")
+        except _API_ERRORS as exc:
+            raise ExchangeConnectionError(f"get_orders_history failed: {type(exc).__name__}: {exc}") from exc
 
         orders: list[Order] = []
         for raw in payload.get("data") or []:
@@ -370,8 +379,8 @@ class ExtendedAdapter(ExchangeAdapter):
                 lambda: client.account.get_positions_history(limit=_HISTORY_FETCH_LIMIT),
                 label="get_positions_history",
             )
-        except (aiohttp.ClientError, X10Error) as exc:
-            raise ExchangeConnectionError(f"get_positions_history failed: {exc}") from exc
+        except _API_ERRORS as exc:
+            raise ExchangeConnectionError(f"get_positions_history failed: {type(exc).__name__}: {exc}") from exc
 
         data = _unwrap(response, "get_positions_history")
         trades = [map_position_history(p, self.exchange_name) for p in data if p.closed_time]
@@ -390,8 +399,8 @@ class ExtendedAdapter(ExchangeAdapter):
                 lambda: client.account.get_trades(limit=_HISTORY_FETCH_LIMIT),
                 label="get_trades",
             )
-        except (aiohttp.ClientError, X10Error) as exc:
-            raise ExchangeConnectionError(f"get_trades failed: {exc}") from exc
+        except _API_ERRORS as exc:
+            raise ExchangeConnectionError(f"get_trades failed: {type(exc).__name__}: {exc}") from exc
 
         data = _unwrap(response, "get_trades")
         trades = [map_trade(t, self.exchange_name) for t in data]

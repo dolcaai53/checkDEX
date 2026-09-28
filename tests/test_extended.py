@@ -1,10 +1,14 @@
-"""Unit tests for ExtendedAdapter — posledni obchodni cena u pozic.
+"""Unit tests for ExtendedAdapter — posledni obchodni cena u pozic, casovy limit
+a opakovani dotazu.
 
-SDK klient je nahrazeny fake objektem a /info/markets obsluhuje lokalni
+SDK klient je nahrazeny fake objektem a prime HTTP dotazy obsluhuje lokalni
 testovaci server — zadne dotazy na Extended.
 """
 from __future__ import annotations
 
+import asyncio
+import functools
+from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -15,8 +19,29 @@ from aiohttp.test_utils import TestServer
 from x10.utils.http import ResponseStatus, WrappedApiResponse
 
 from app.config import Config
+from app.exceptions import ExchangeConnectionError
+from app.exchanges import extended as extended_module
 from app.exchanges.extended import ExtendedAdapter, parse_last_prices
+from app.models.order import OrderStatus
+from app.utils.retry import with_retry
 from tests.test_event_engine import _sdk_position
+
+# Limit session v testech misto 15 s — pomaly dotaz se overi rychle.
+_TEST_TIMEOUT = aiohttp.ClientTimeout(total=0.2)
+_SINCE = datetime(2026, 9, 28, tzinfo=timezone.utc)
+
+
+def _config() -> Config:
+    """Konfigurace s vymyslenymi klici — testy nic neposilaji na Extended."""
+    return Config(
+        _env_file=None,
+        extended_api_key="test-key",
+        extended_public_key="0x1",
+        extended_private_key="0x2",
+        extended_vault="1",
+        telegram_bot_token="0000:test",
+        telegram_chat_id="-1001",
+    )
 
 
 def _market(name: str, last_price: str | None) -> dict:
@@ -76,17 +101,8 @@ async def extended():
 
     app = web.Application()
     app.router.add_get("/api/v1/info/markets", handler)
-    config = Config(
-        _env_file=None,
-        extended_api_key="test-key",
-        extended_public_key="0x1",
-        extended_private_key="0x2",
-        extended_vault="1",
-        telegram_bot_token="0000:test",
-        telegram_chat_id="-1001",
-    )
     async with TestServer(app) as server:
-        adapter = ExtendedAdapter(config)
+        adapter = ExtendedAdapter(_config())
         adapter._client = SimpleNamespace(account=_FakeAccount())
         adapter._session = aiohttp.ClientSession()
         adapter._api_base_url = str(server.make_url("/api/v1"))
@@ -132,3 +148,108 @@ async def test_get_positions_no_price_request_without_positions(extended) -> Non
 
     assert await adapter.get_positions() == []
     assert requests == []
+
+
+# ---------------------------------------------------------------------------
+# Casovy limit a opakovani dotazu
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def no_retry_delay(monkeypatch):
+    """Opakovani dotazu bez pauzy mezi pokusy — test neceka na backoff."""
+    monkeypatch.setattr(extended_module, "with_retry", functools.partial(with_retry, base_delay=0))
+
+
+async def test_connect_sets_request_timeout() -> None:
+    """Dotazy pres SDK i prime dotazy jdou pres session s limitem 15 s (SDK ma 500 s)."""
+    adapter = ExtendedAdapter(_config())
+    await adapter.connect()
+    try:
+        assert adapter._session.timeout.total == 15
+        assert adapter._client.account._BaseModule__session is adapter._session
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("get_open_orders", ()),
+        ("get_positions", ()),
+        ("get_positions_history", (_SINCE,)),
+        ("get_trades", (_SINCE,)),
+    ],
+)
+async def test_sdk_call_timeout_raises_connection_error(extended, no_retry_delay, method, args) -> None:
+    adapter, _, _ = extended
+    calls: list[str] = []
+
+    async def timeout(**kwargs):
+        calls.append(method)
+        raise asyncio.TimeoutError
+
+    setattr(adapter._client.account, method, timeout)
+
+    with pytest.raises(ExchangeConnectionError, match=f"{method} failed: TimeoutError"):
+        await getattr(adapter, method)(*args)
+    assert len(calls) == 4  # prvni pokus + 3 opakovani
+
+
+def _raw_order(order_id: int) -> dict:
+    """Polozka odpovedi /user/orders/history — jen pole, ktera adapter cte."""
+    return {
+        "id": order_id,
+        "market": "BTC-USD",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "63250.5",
+        "qty": "0.25",
+        "filledQty": "0.25",
+        "status": "FILLED",
+        "createdTime": 1_790_000_000_000,
+        "updatedTime": 1_790_000_060_000,
+    }
+
+
+@pytest.fixture
+async def orders_history():
+    """Adapter s limitem _TEST_TIMEOUT; /user/orders/history obsluhuje lokalni server.
+
+    Vraci (adapter, state): prvnich state["slow"] dotazu dostane odpoved az po
+    vyprseni limitu, state["requests"] pocita prijate dotazy.
+    """
+    state = {"slow": 0, "requests": 0}
+
+    async def handler(request: web.Request) -> web.Response:
+        state["requests"] += 1
+        if state["requests"] <= state["slow"]:
+            await asyncio.sleep(_TEST_TIMEOUT.total * 2)
+        return web.json_response({"status": "OK", "data": [_raw_order(1)]})
+
+    app = web.Application()
+    app.router.add_get("/api/v1/user/orders/history", handler)
+    async with TestServer(app) as server:
+        adapter = ExtendedAdapter(_config())
+        adapter._session = aiohttp.ClientSession(timeout=_TEST_TIMEOUT)
+        adapter._api_base_url = str(server.make_url("/api/v1"))
+        yield adapter, state
+        await adapter._session.close()
+
+
+async def test_get_orders_history_retries_after_timeout(orders_history, no_retry_delay) -> None:
+    adapter, state = orders_history
+    state["slow"] = 1
+
+    orders = await adapter.get_orders_history(_SINCE)
+
+    assert [(o.id, o.status) for o in orders] == [("1", OrderStatus.FILLED)]
+    assert state["requests"] == 2  # po vyprseni limitu druhy pokus
+
+
+async def test_get_orders_history_timeout_raises_connection_error(orders_history, no_retry_delay) -> None:
+    adapter, state = orders_history
+    state["slow"] = 99
+
+    with pytest.raises(ExchangeConnectionError, match="get_orders_history failed: TimeoutError"):
+        await adapter.get_orders_history(_SINCE)
+    assert state["requests"] == 4  # prvni pokus + 3 opakovani
