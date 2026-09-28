@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 # under normal trading conditions. Increase if many events per minute are expected.
 _HISTORY_FETCH_LIMIT = 50
 
+# Posledni cena je ve zpravach jen informativni — jeji dotaz nesmi zdrzet sledovani
+# pozic tak dlouho jako vychozi limit SDK (CLIENT_TIMEOUT, 500 s).
+_LAST_PRICE_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
 # String-keyed maps — pydantic v2 with StrEnum stores the string value in model
 # fields, so sdk_model.status returns "NEW" not SdkOrderStatus.NEW.
 _ORDER_STATUS_MAP: dict[str, OrderStatus] = {
@@ -110,8 +114,14 @@ def map_order(sdk_order: OpenOrderModel, exchange: str) -> Order:
     )
 
 
-def map_position(sdk_pos: PositionModel, exchange: str) -> Position:
-    """Map SDK PositionModel to internal Position model."""
+def map_position(
+    sdk_pos: PositionModel, exchange: str, last_price: Decimal | None = None
+) -> Position:
+    """Map SDK PositionModel to internal Position model.
+
+    Posledni obchodni cenu pozice neobsahuji — adapter ji nacita zvlast
+    (viz parse_last_prices) a predava v *last_price*.
+    """
     return Position(
         market=sdk_pos.market,
         exchange=exchange,
@@ -119,10 +129,30 @@ def map_position(sdk_pos: PositionModel, exchange: str) -> Position:
         size=sdk_pos.size,
         entry_price=sdk_pos.open_price,
         mark_price=sdk_pos.mark_price,
+        last_price=last_price,
         leverage=sdk_pos.leverage,
         unrealized_pnl=sdk_pos.unrealised_pnl,
         opened_at=_unix_ms_to_utc(sdk_pos.created_at),
     )
+
+
+def parse_last_prices(payload: object) -> dict[str, Decimal]:
+    """Z odpovedi Extended /info/markets vrati {market: posledni obchodni cena}.
+
+    Cena je v data[i].marketStats.lastPrice. Trh bez platne ceny se vynecha,
+    necekany tvar odpovedi vrati prazdny slovnik.
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return {}
+
+    prices: dict[str, Decimal] = {}
+    for market in data:
+        try:
+            prices[str(market["name"])] = Decimal(str(market["marketStats"]["lastPrice"]))
+        except (KeyError, TypeError, ArithmeticError):
+            continue
+    return prices
 
 
 def map_position_history(sdk_hist: PositionHistoryModel, exchange: str) -> Trade:
@@ -269,9 +299,31 @@ class ExtendedAdapter(ExchangeAdapter):
             raise ExchangeConnectionError(f"get_positions failed: {exc}") from exc
 
         data = _unwrap(response, "get_positions")
-        positions = [map_position(p, self.exchange_name) for p in data]
+        # Posledni ceny se nacitaji jen kdyz jsou otevrene pozice — jinak neni co doplnit.
+        last_prices = await self._get_last_prices([p.market for p in data]) if data else {}
+        positions = [map_position(p, self.exchange_name, last_prices.get(p.market)) for p in data]
         logger.debug("Fetched positions", extra={"count": len(positions)})
         return positions
+
+    async def _get_last_prices(self, markets: list[str]) -> dict[str, Decimal]:
+        """Posledni obchodni ceny trhu (verejny dotaz /info/markets, jeden pro vsechny trhy).
+
+        Cena je ve zpravach jen informativni — kdyz dotaz selze, zaloguje se
+        varovani a pozice se vrati bez ni (zprava pak ukaze mark cenu).
+        """
+        url = f"{self._api_base_url}/info/markets"
+        params = [("market", market) for market in sorted(set(markets))]
+        try:
+            async with self._session.get(url, params=params, timeout=_LAST_PRICE_TIMEOUT) as resp:
+                resp.raise_for_status()
+                payload = await resp.json()
+        except Exception as exc:
+            logger.warning(
+                "Extended last prices fetch failed",
+                extra={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            return {}
+        return parse_last_prices(payload)
 
     async def get_orders_history(self, since: datetime) -> list[Order]:
         """Fetch recent order history.

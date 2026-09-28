@@ -17,6 +17,7 @@ from app.exchanges.hyperliquid import (
     map_fill_to_trade,
     map_order,
     map_position,
+    parse_last_price,
     parse_mark_prices,
     parse_user_role,
 )
@@ -173,6 +174,15 @@ def test_map_position_without_mark_price():
     assert map_position(_asset_position(), EXCHANGE).mark_price is None
 
 
+def test_map_position_last_price():
+    pos = map_position(_asset_position(), EXCHANGE, last_price=Decimal("3149.9"))
+    assert pos.last_price == Decimal("3149.9")
+
+
+def test_map_position_without_last_price():
+    assert map_position(_asset_position(), EXCHANGE).last_price is None
+
+
 # ---------------------------------------------------------------------------
 # parse_mark_prices
 # ---------------------------------------------------------------------------
@@ -200,6 +210,32 @@ def test_parse_mark_prices_skips_market_without_price():
 )
 def test_parse_mark_prices_unexpected_response(response):
     assert parse_mark_prices(response) == {}
+
+
+# ---------------------------------------------------------------------------
+# parse_last_price
+# ---------------------------------------------------------------------------
+
+_DAY_MS = 24 * 60 * 60 * 1000
+
+
+def _candle(close: str | None, t: int = 1_790_000_000_000) -> dict:
+    """Denni svicka z candleSnapshot; "c" je zaviraci (u bezici svicky posledni) cena."""
+    return {"t": t, "T": t + _DAY_MS - 1, "s": "BTC", "i": "1d", "o": "1", "c": close, "n": 10}
+
+
+def test_parse_last_price_takes_latest_candle():
+    t = 1_790_000_000_000
+    candles = [_candle("82100.0", t=t), _candle("82926.0", t=t + _DAY_MS)]
+    assert parse_last_price(candles) == Decimal("82926.0")
+
+
+@pytest.mark.parametrize(
+    "response",
+    [None, "unexpected", {}, [], [{"t": 1}], [_candle(None)], [_candle("abc")]],
+)
+def test_parse_last_price_unexpected_response(response):
+    assert parse_last_price(response) is None
 
 
 # ---------------------------------------------------------------------------
@@ -305,8 +341,13 @@ def _fake_info_class(
     asset_positions=(),
     ctxs_response=None,
     ctxs_error=None,
+    candles=None,
+    candles_error=None,
 ):
-    """Vytvori nahradu hyperliquid.info.Info; instance jsou v FakeInfo.created."""
+    """Vytvori nahradu hyperliquid.info.Info; instance jsou v FakeInfo.created.
+
+    *candles* je {coin: odpoved candleSnapshot}; trh, ktery v nem neni, nema svicky.
+    """
     created = []
 
     class FakeInfo:
@@ -322,6 +363,10 @@ def _fake_info_class(
 
         def post(self, path, payload):
             self.posts.append((path, payload))
+            if payload["type"] == "candleSnapshot":
+                if candles_error is not None:
+                    raise candles_error
+                return (candles or {}).get(payload["req"]["coin"], [])
             if post_error is not None:
                 raise post_error
             return role_response
@@ -471,3 +516,63 @@ async def test_get_positions_no_price_request_without_positions(monkeypatch):
 
     assert await adapter.get_positions() == []
     assert info.ctxs_calls == 0
+    assert _candle_requests(info) == []
+
+
+# ---------------------------------------------------------------------------
+# get_positions() — posledni cena z candleSnapshot
+# ---------------------------------------------------------------------------
+
+def _candle_requests(info) -> list[dict]:
+    """Obsah "req" vsech dotazu candleSnapshot, ktere adapter poslal."""
+    return [payload["req"] for _, payload in info.posts if payload["type"] == "candleSnapshot"]
+
+
+async def test_get_positions_fills_last_price(monkeypatch):
+    adapter, info = await _connected_adapter(
+        monkeypatch,
+        asset_positions=[_asset_position(coin="ETH"), _asset_position(coin="DOGE", szi="-100")],
+        ctxs_response=_meta_and_ctxs(ETH="2648.7", DOGE="0.093"),
+        candles={"ETH": [_candle("2640.0"), _candle("2650.1")], "DOGE": [_candle("0.09312")]},
+    )
+
+    positions = await adapter.get_positions()
+
+    assert {p.market: p.last_price for p in positions} == {
+        "ETH-USDC": Decimal("2650.1"),
+        "DOGE-USDC": Decimal("0.09312"),
+    }
+    assert positions[0].mark_price == Decimal("2648.7")  # mark cena zustava jako zaloha
+    requests = _candle_requests(info)
+    assert sorted(r["coin"] for r in requests) == ["DOGE", "ETH"]  # jeden dotaz na trh
+    assert all(r["interval"] == "1d" for r in requests)
+    assert all(r["endTime"] - r["startTime"] == 2 * _DAY_MS for r in requests)
+
+
+async def test_get_positions_without_last_price_when_fetch_fails(monkeypatch, caplog):
+    adapter, _ = await _connected_adapter(
+        monkeypatch,
+        asset_positions=[_asset_position(coin="ETH")],
+        ctxs_response=_meta_and_ctxs(ETH="2648.7"),
+        candles_error=TimeoutError("read timed out"),
+    )
+
+    with caplog.at_level("WARNING"):
+        positions = await adapter.get_positions()
+
+    # Pozice se vrati dal s mark cenou, jen bez posledni ceny — zprava ukaze Mark.
+    assert positions[0].last_price is None
+    assert positions[0].mark_price == Decimal("2648.7")
+    assert "Hyperliquid last prices fetch failed" in caplog.text
+
+
+async def test_get_positions_market_without_candles(monkeypatch):
+    adapter, _ = await _connected_adapter(
+        monkeypatch,
+        asset_positions=[_asset_position(coin="ETH")],
+        candles={"BTC": [_candle("82926.0")]},
+    )
+
+    positions = await adapter.get_positions()
+
+    assert positions[0].last_price is None

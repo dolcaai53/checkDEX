@@ -21,6 +21,10 @@ _TESTNET_URL = "https://api.hyperliquid-testnet.xyz"
 # takze bez nej muze dotaz pri vypadku site viset donekonecna.
 _REQUEST_TIMEOUT_SECONDS = 15.0
 
+# Okno dotazu na denni svicky pro posledni cenu: zahrne vcerejsi i dnesni svicku,
+# takze cena se najde i tesne po pulnoci UTC, kdy dnes jeste nebyl obchod.
+_LAST_PRICE_WINDOW_MS = 2 * 24 * 60 * 60 * 1000
+
 _HL_BUY = "B"
 _HL_SELL = "A"
 
@@ -82,12 +86,16 @@ def map_order(hl_order: dict, exchange: str) -> Order:
 
 
 def map_position(
-    hl_asset_pos: dict, exchange: str, mark_price: Decimal | None = None
+    hl_asset_pos: dict,
+    exchange: str,
+    mark_price: Decimal | None = None,
+    last_price: Decimal | None = None,
 ) -> Position:
     """Map Hyperliquid assetPosition dict to internal Position model.
 
-    Hyperliquid v assetPositions mark cenu neposila — adapter ji nacita zvlast
-    (viz parse_mark_prices) a predava v *mark_price*.
+    Hyperliquid v assetPositions mark ani posledni cenu neposila — adapter je
+    nacita zvlast (viz parse_mark_prices, parse_last_price) a predava
+    v *mark_price* a *last_price*.
     """
     pos = hl_asset_pos.get("position", hl_asset_pos)
     szi = Decimal(str(pos["szi"]))
@@ -108,6 +116,7 @@ def map_position(
         size=size,
         entry_price=Decimal(str(pos["entryPx"])),
         mark_price=mark_price,
+        last_price=last_price,
         leverage=leverage,
         unrealized_pnl=unrealized_pnl,
         opened_at=None,
@@ -183,6 +192,20 @@ def parse_mark_prices(response: object) -> dict[str, Decimal]:
         except (KeyError, TypeError, ArithmeticError):
             continue
     return prices
+
+
+def parse_last_price(candles: object) -> Decimal | None:
+    """Z odpovedi Hyperliquid candleSnapshot vrati posledni obchodni cenu.
+
+    Svicky jsou serazene od nejstarsi; zaviraci cena ("c") nejnovejsi svicky
+    je cena posledniho obchodu. Prazdna nebo necekana odpoved vrati None.
+    """
+    if not isinstance(candles, list) or not candles:
+        return None
+    try:
+        return Decimal(str(candles[-1]["c"]))
+    except (KeyError, TypeError, ArithmeticError):
+        return None
 
 
 async def _fills_by_time(info, address: str, start_ms: int) -> list[dict]:
@@ -335,17 +358,28 @@ class HyperliquidAdapter(ExchangeAdapter):
             raise ExchangeConnectionError(f"get_positions failed: {exc}") from exc
 
         asset_positions = state.get("assetPositions", [])
-        # Mark ceny se nacitaji jen kdyz jsou otevrene pozice — jinak neni co doplnit.
-        mark_prices = await self._get_mark_prices(info) if asset_positions else {}
+        coins = [
+            ap["position"]["coin"] for ap in asset_positions if ap.get("position", {}).get("coin")
+        ]
+        mark_prices: dict[str, Decimal] = {}
+        last_prices: dict[str, Decimal] = {}
+        if coins:
+            # Ceny se nacitaji jen kdyz jsou otevrene pozice — jinak neni co doplnit.
+            mark_prices, last_prices = await asyncio.gather(
+                self._get_mark_prices(info), self._get_last_prices(info, coins)
+            )
 
         positions: list[Position] = []
         for asset_pos in asset_positions:
             pos = asset_pos.get("position", {})
             if Decimal(str(pos.get("szi", "0"))) == 0:
                 continue
+            coin = pos.get("coin")
             try:
                 positions.append(
-                    map_position(asset_pos, self.exchange_name, mark_prices.get(pos.get("coin")))
+                    map_position(
+                        asset_pos, self.exchange_name, mark_prices.get(coin), last_prices.get(coin)
+                    )
                 )
             except Exception:
                 logger.debug(
@@ -367,6 +401,38 @@ class HyperliquidAdapter(ExchangeAdapter):
             logger.warning("Hyperliquid mark prices fetch failed", extra={"error": str(exc)})
             return {}
         return parse_mark_prices(response)
+
+    async def _get_last_prices(self, info, coins: list[str]) -> dict[str, Decimal]:
+        """Posledni obchodni ceny trhu s otevrenou pozici (verejny dotaz candleSnapshot).
+
+        Hyperliquid posledni cenu primo neposila — bere se zaviraci cena nejnovejsi
+        denni svicky. Jeden dotaz na trh, dotazy bezi soubezne. Trh, u ktereho
+        dotaz selze, zustane bez ceny a zprava ukaze mark cenu.
+        """
+        end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        request = {"interval": "1d", "startTime": end_ms - _LAST_PRICE_WINDOW_MS, "endTime": end_ms}
+        results = await asyncio.gather(
+            *(
+                asyncio.to_thread(
+                    info.post, "/info", {"type": "candleSnapshot", "req": {"coin": coin, **request}}
+                )
+                for coin in coins
+            ),
+            return_exceptions=True,
+        )
+
+        prices: dict[str, Decimal] = {}
+        errors: dict[str, str] = {}
+        for coin, result in zip(coins, results):
+            if isinstance(result, BaseException):
+                errors[coin] = f"{type(result).__name__}: {result}"
+                continue
+            price = parse_last_price(result)
+            if price is not None:
+                prices[coin] = price
+        if errors:
+            logger.warning("Hyperliquid last prices fetch failed", extra={"errors": errors})
+        return prices
 
     async def get_orders_history(self, since: datetime) -> list[Order]:
         """Return recently filled orders reconstructed from user fills.

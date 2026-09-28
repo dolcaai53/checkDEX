@@ -28,6 +28,7 @@ from app.notifiers import telegram
 from app.notifiers.telegram import (
     ExchangePositions,
     TelegramNotifier,
+    _price,
     format_daily_summary,
     format_exchange_error,
     format_order_filled,
@@ -92,6 +93,29 @@ def _trade(pnl: str) -> Trade:
 def _no_invalid_tags(text: str) -> None:
     for tag in _INVALID_HTML_TAGS:
         assert tag not in text, f"Invalid HTML tag found: {tag!r} in:\n{text}"
+
+
+# ---------------------------------------------------------------------------
+# Formatovani cen
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("63250.5", "63250.5"),
+        ("80079.584688000002", "80079.58"),  # sum z plovouci carky (Extended mark)
+        ("0.004081", "0.004081"),  # levny coin si necha presnost
+        ("0.00408123456", "0.004081235"),  # 7 platnych cislic
+        ("0.00000012345678", "0.0000001234568"),  # bez exponentu
+        ("2450.00", "2450"),  # bez nul na konci
+        ("60000", "60000"),
+        ("1E+3", "1000"),
+        ("1234567890.12", "1234567890"),  # cela cast se nezaokrouhluje
+        ("0", "0"),
+    ],
+)
+def test_price_format(value: str, expected: str) -> None:
+    assert _price(Decimal(value)) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +205,21 @@ def test_position_updated_no_invalid_html() -> None:
     _no_invalid_tags(format_position_updated(PositionUpdatedEvent(position=current, previous=prev)))
 
 
+def test_position_updated_shows_last_price_instead_of_mark() -> None:
+    current = _position(size="0.50").model_copy(update={"last_price": Decimal("63512.25")})
+    msg = format_position_updated(PositionUpdatedEvent(position=current, previous=_position()))
+    assert "Entry: 63250.5\nLast: 63512.25\nUnrealized PnL: +62.38 USDC" in msg
+    assert "Mark:" not in msg
+
+
+def test_position_updated_falls_back_to_mark() -> None:
+    msg = format_position_updated(
+        PositionUpdatedEvent(position=_position(size="0.50"), previous=_position())
+    )
+    assert "Entry: 63250.5\nMark: 63500\nUnrealized PnL: +62.38 USDC" in msg
+    assert "Last:" not in msg
+
+
 # ---------------------------------------------------------------------------
 # POSITION CLOSED — PROFIT
 # ---------------------------------------------------------------------------
@@ -207,6 +246,11 @@ def test_position_closed_profit_has_pct() -> None:
     msg = format_position_closed(PositionClosedEvent(trade=_trade("157.38")))
     assert "%" in msg
     assert "approx" in msg
+
+
+def test_position_closed_prices() -> None:
+    msg = format_position_closed(PositionClosedEvent(trade=_trade("157.38")))
+    assert "Entry: 63250.5\nExit: 63880\n" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -283,13 +327,43 @@ def test_daily_summary_layout() -> None:
     assert lines[3:] == [
         "",
         "<b>BTC-USD</b> LONG 10x",
-        "  Size: 0.25 | Entry: 63250.50",
-        "  Mark: 63500.00 | uPnL: +62.38 USDC",
+        "  Size: 0.25 | Entry: 63250.5",
+        "  Mark: 63500 | uPnL: +62.38 USDC",
         "",
         "─────────────────────",
         "Total uPnL: <b>+62.38 USDC</b>",
         "Open positions: 1",
     ]
+
+
+def test_position_lines_prefer_last_price() -> None:
+    position = _position().model_copy(update={"last_price": Decimal("63512.25")})
+    lines = format_daily_summary("Extended", "mainnet", [position]).split("\n")
+    # Stejny pocet radku jako s mark cenou — Last nahrazuje Mark, nepridava radek.
+    assert lines[5:7] == ["  Size: 0.25 | Entry: 63250.5", "  Last: 63512.25 | uPnL: +62.38 USDC"]
+    assert len(lines) == len(format_daily_summary("Extended", "mainnet", [_position()]).split("\n"))
+
+
+def test_position_lines_without_any_price() -> None:
+    position = _position().model_copy(update={"mark_price": None})
+    msg = format_positions_report([ExchangePositions("Hyperliquid", "mainnet", [position])])
+    assert "  Mark: — | uPnL: +62.38 USDC" in msg
+
+
+def test_position_lines_keep_cheap_coin_precision() -> None:
+    position = Position(
+        market="1000PEPE-USD",
+        exchange="Extended",
+        side=PositionSide.LONG,
+        size=Decimal("50000"),
+        entry_price=Decimal("0.004081"),
+        mark_price=Decimal("0.0041240000000001"),
+        last_price=Decimal("0.004131"),
+        unrealized_pnl=Decimal("2.5"),
+    )
+    msg = format_positions_report([ExchangePositions("Extended", "mainnet", [position])])
+    assert "  Size: 50000 | Entry: 0.004081" in msg
+    assert "  Last: 0.004131 | uPnL: +2.50 USDC" in msg
 
 
 # ---------------------------------------------------------------------------

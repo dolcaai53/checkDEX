@@ -29,6 +29,9 @@ _API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 _UPDATES_URL = "https://api.telegram.org/bot{token}/getUpdates"
 # Delsi text chyby se ve zprave zkrati (limit Telegram zpravy je 4096 znaku).
 _MAX_ERROR_CHARS = 500
+# Presnost cen ve zpravach — levne coiny si nechaji desetinna mista, sum z plovouci
+# carky (napr. 80079.584688000002) se orizne.
+_PRICE_SIGNIFICANT_DIGITS = 7
 
 
 class ExchangePositions(NamedTuple):
@@ -51,6 +54,25 @@ def _duration(opened_at: datetime | None, closed_at: datetime) -> str:
     delta = closed_at - opened_at
     total_minutes = int(delta.total_seconds() / 60)
     return f"{total_minutes // 60:02d}h {total_minutes % 60:02d}m"
+
+
+def _price(value: Decimal) -> str:
+    """Cena na nejvyse 7 platnych cislic, bez nul na konci a bez exponentu.
+
+    Cela cast se nikdy nezaokrouhluje: 63250.5, 80079.58, 0.004081, 2450.
+    """
+    if not value.is_finite():
+        return str(value)
+    decimals = max(0, _PRICE_SIGNIFICANT_DIGITS - value.adjusted() - 1)
+    text = f"{value.quantize(Decimal(1).scaleb(-decimals)):f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _current_price(p: Position) -> str:
+    """Aktualni cena pozice: posledni obchod (Last), jinak mark cena (Mark)."""
+    if p.last_price:
+        return f"Last: {_price(p.last_price)}"
+    return f"Mark: {_price(p.mark_price) if p.mark_price else '—'}"
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +105,7 @@ def format_exchange_error(exchange: str, network: str, error: str) -> str:
 
 def format_order_opened(event: OrderOpenedEvent) -> str:
     o = event.order
-    price = f"{o.price:.2f}" if o.price else "MARKET"
+    price = _price(o.price) if o.price else "MARKET"
     return (
         f"📋 <b>ORDER OPENED</b>\n"
         f"Exchange: {o.exchange}\n"
@@ -100,7 +122,7 @@ def format_order_opened(event: OrderOpenedEvent) -> str:
 
 def format_order_updated(event: OrderUpdatedEvent) -> str:
     o = event.order
-    price = f"{o.price:.2f}" if o.price else "MARKET"
+    price = _price(o.price) if o.price else "MARKET"
     return (
         f"🔄 <b>ORDER UPDATED</b>\n"
         f"Exchange: {o.exchange}\n"
@@ -117,7 +139,7 @@ def format_order_updated(event: OrderUpdatedEvent) -> str:
 
 def format_order_filled(event: OrderFilledEvent) -> str:
     o = event.order
-    price = f"{o.price:.2f}" if o.price else "MARKET"
+    price = _price(o.price) if o.price else "MARKET"
     return (
         f"✅ <b>ORDER FILLED</b>\n"
         f"Exchange: {o.exchange}\n"
@@ -141,7 +163,7 @@ def format_position_opened(event: PositionOpenedEvent) -> str:
         f"Market: {p.market}\n"
         f"Side: {p.side}\n"
         f"Size: {p.size}\n"
-        f"Entry: {p.entry_price:.2f}\n"
+        f"Entry: {_price(p.entry_price)}\n"
         f"Leverage: {leverage}\n"
         f"Opened at: {_utc(p.opened_at)}"
     )
@@ -150,7 +172,6 @@ def format_position_opened(event: PositionOpenedEvent) -> str:
 def format_position_updated(event: PositionUpdatedEvent) -> str:
     p = event.position
     prev = event.previous
-    mark = f"{p.mark_price:.2f}" if p.mark_price else "—"
     upnl = fmt_pnl(p.unrealized_pnl) if p.unrealized_pnl is not None else "—"
     return (
         f"🔄 <b>POSITION UPDATED</b>\n"
@@ -158,8 +179,8 @@ def format_position_updated(event: PositionUpdatedEvent) -> str:
         f"Market: {p.market}\n"
         f"Side: {p.side}\n"
         f"Size: {p.size} (was {prev.size})\n"
-        f"Entry: {p.entry_price:.2f}\n"
-        f"Mark: {mark}\n"
+        f"Entry: {_price(p.entry_price)}\n"
+        f"{_current_price(p)}\n"
         f"Unrealized PnL: {upnl}"
     )
 
@@ -178,8 +199,8 @@ def format_position_closed(event: PositionClosedEvent) -> str:
         f"Market: {t.market}",
         f"Side: {t.side}",
         f"Size: {t.size}",
-        f"Entry: {t.entry_price:.2f}",
-        f"Exit: {t.exit_price:.2f}",
+        f"Entry: {_price(t.entry_price)}",
+        f"Exit: {_price(t.exit_price)}",
         f"PnL: <b>{pnl_str}</b>",
     ]
     if pct_str:
@@ -198,12 +219,11 @@ def _position_lines(positions: list[Position]) -> list[str]:
     lines: list[str] = []
     total_upnl: Decimal | None = None
     for p in positions:
-        mark = f"{p.mark_price:.2f}" if p.mark_price else "—"
         upnl_str = fmt_pnl(p.unrealized_pnl) if p.unrealized_pnl is not None else "—"
         leverage = f" {p.leverage}x" if p.leverage else ""
         lines.append(f"<b>{p.market}</b> {p.side}{leverage}")
-        lines.append(f"  Size: {p.size} | Entry: {p.entry_price:.2f}")
-        lines.append(f"  Mark: {mark} | uPnL: {upnl_str}")
+        lines.append(f"  Size: {p.size} | Entry: {_price(p.entry_price)}")
+        lines.append(f"  {_current_price(p)} | uPnL: {upnl_str}")
         lines.append("")
         if p.unrealized_pnl is not None:
             total_upnl = p.unrealized_pnl if total_upnl is None else total_upnl + p.unrealized_pnl

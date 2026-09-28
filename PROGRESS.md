@@ -2,7 +2,7 @@
 
 ## Stav projektu
 
-**Aktualni stav:** ✅ Projekt bezi v produkci na mainnetu (Extended) — Faze 1–7 hotove, runtime opravy overeny live. Pozdeji pridano: denni souhrn pozic, Hyperliquid adapter, vice DEXu soucasne, Telegram prikaz /positions, mark cena u Hyperliquid pozic — 192 testu prochazi. Nasazeni techto novych funkci na server neovereno.
+**Aktualni stav:** ✅ Projekt bezi v produkci na mainnetu (Extended) — Faze 1–7 hotove, runtime opravy overeny live. Pozdeji pridano: denni souhrn pozic, Hyperliquid adapter, vice DEXu soucasne, Telegram prikaz /positions, mark cena u Hyperliquid pozic, posledni cena (Last) u pozic a presnost cen — 232 testu prochazi. Nasazeni techto novych funkci na server neovereno.
 
 ---
 
@@ -100,22 +100,34 @@
 - Overeno proti skutecnemu API (hlavni ucet): `Mark` u BTC a GRAM odpovida uPnL
 - 15 novych testu v `tests/test_hyperliquid.py`
 
+### Posledni cena (Last) u pozic a presnost cen ✅ (2026-09-28)
+- Aktualni cena pozice = posledni obchodni cena (`Last`); kdyz neni, stejny radek ukaze `Mark` — zadny radek navic
+- Projevi se v dennim souhrnu, `/positions` i `POSITION UPDATED`; notifikace se dal posilaji jen pri zmene velikosti pozice
+- Nove pole `Position.last_price` (volitelne — stare snapshoty v DB se nactou bez nej)
+- Extended: `marketStats.lastPrice` z verejneho `GET /info/markets` — jeden dotaz pro vsechny trhy s pozici, timeout 15 s (`parse_last_prices`)
+- Hyperliquid: zaviraci cena posledni denni svicky (`candleSnapshot`, okno 2 dny) — jeden dotaz na trh (`parse_last_price`)
+- Kdyz dotaz selze: varovani v logu, zprava ukaze `Mark`, pozice se sleduji dal
+- Ceny ve vsech zpravach (ordery, pozice, uzavrene obchody) na nejvyse 7 platnych cislic bez nul na konci (`_price`): `0.004081` zustane, `80079.584688000002` → `80079.58`, cela cast se nezaokrouhluje; PnL dal na 2 desetinna mista
+- Overeno proti skutecnemu API: Extended `lastPrice` odpovida poslednimu verejnemu obchodu, Hyperliquid zaviraci cena svicky = posledni obchod (`recentTrades`); Extended ucet mel pri overeni zadne otevrene pozice — cesta s pozicemi overena unit testy
+- Nove testy: `tests/test_extended.py` (10), dalsi v hyperliquid (13), telegram (16), event_engine (1)
+
 ---
 
 ## Testovací výsledky
 
 ```
-192 passed, 1 warning   (2026-09-28, v Dockeru; warning = DeprecationWarning z python-json-logger)
+232 passed, 1 warning   (2026-09-28, v Dockeru; warning = DeprecationWarning z python-json-logger)
 ```
 
 - tests/test_commands.py — 17 testu (/positions, getUpdates)
 - tests/test_config.py — 13 testu (ACTIVE_EXCHANGES carka/JSON, .env.example)
-- tests/test_event_engine.py — 37 testu (mapping + detekce + prvni spusteni)
-- tests/test_hyperliquid.py — 47 testu (mapping + connect, kontrola API penezenky, mark ceny)
+- tests/test_event_engine.py — 38 testu (mapping + detekce + prvni spusteni)
+- tests/test_extended.py — 10 testu (posledni ceny z /info/markets)
+- tests/test_hyperliquid.py — 60 testu (mapping + connect, kontrola API penezenky, mark a posledni ceny)
 - tests/test_main.py — 8 testu (opakovani pripojeni, nezavislost burz, uklid)
 - tests/test_pnl.py — 16 testu
 - tests/test_storage.py — 25 testu
-- tests/test_telegram.py — 29 testu
+- tests/test_telegram.py — 45 testu (vcetne presnosti cen a radku Last/Mark)
 
 ---
 

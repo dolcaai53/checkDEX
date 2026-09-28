@@ -90,7 +90,7 @@ Put that address into `.env` and run `docker compose up -d --force-recreate`.
 - If the role check itself fails (e.g. a timeout), a warning is logged and monitoring continues.
 - An address with no account activity on Hyperliquid is only logged as a warning — check it for typos.
 - Every Hyperliquid request has a 15-second timeout (the SDK sets none by default), so a slow API cannot block the monitor.
-- Hyperliquid does not send the mark price with positions. When positions are open, checkDEX asks for it with one extra public request (`metaAndAssetCtxs`) on each positions poll, so the daily summary, `/positions` and `POSITION UPDATED` show it on the `Mark` line. If that request fails, positions are still monitored and `Mark` shows `—`.
+- Hyperliquid sends neither the last traded price nor the mark price with positions. When positions are open, checkDEX fetches both with public requests on each positions poll (see [Prices in messages](#prices-in-messages)).
 
 ## Setting up the Telegram bot
 
@@ -107,7 +107,7 @@ Besides sending notifications, the bot answers commands sent in the chat:
 
 | Command | Reply |
 |---|---|
-| `/positions` | Current open positions on all monitored exchanges — market, side, leverage, size, entry, mark, unrealized PnL and total unrealized PnL |
+| `/positions` | Current open positions on all monitored exchanges — market, side, leverage, size, entry, current price (see [Prices in messages](#prices-in-messages)), unrealized PnL and total unrealized PnL |
 
 How it works:
 
@@ -121,6 +121,26 @@ How it works:
 - Disable it with `ENABLE_TELEGRAM_COMMANDS=false`.
 
 **One reader per bot token:** Telegram hands out updates to only one reader at a time. If another program reads updates of the same bot token, or a webhook is set for it, Telegram answers with `409 Conflict` and `/positions` gets no reply (notifications keep working). Give the other program its own bot, or set `ENABLE_TELEGRAM_COMMANDS=false`.
+
+## Prices in messages
+
+The daily summary, `/positions` and `POSITION UPDATED` show the current price of a position on one line:
+
+```
+BTC-USD LONG 10x
+  Size: 0.25 | Entry: 63250.5
+  Last: 63512.25 | uPnL: +65.44 USDC
+```
+
+- `Last` is the last traded price. If the exchange does not return it, the same line shows `Mark` (mark price) instead, or `Mark: —` when neither is available.
+- Prices are fetched only when positions are open, on each positions poll. If the request fails, a warning is logged, positions are still monitored and the message shows `Mark`.
+
+| Exchange | Last traded price | Mark price |
+|---|---|---|
+| Extended | `marketStats.lastPrice` from the public `GET /info/markets` — one request for all markets with an open position (15 s timeout) | sent with the position |
+| Hyperliquid | close of the newest daily candle from `candleSnapshot` — one request per market with an open position | `metaAndAssetCtxs` — one request for all markets |
+
+**Precision:** all prices in messages (entry, exit, order price, last, mark) show up to 7 significant digits without trailing zeros, e.g. `63250.5`, `0.004081`, `2450`. Cheap coins keep their decimals, and float noise from the API (Extended sends mark prices like `80079.584688000002`) is cut off (`80079.58`). The integer part is never rounded. PnL amounts stay at 2 decimals.
 
 ## Configuration
 
@@ -244,8 +264,8 @@ Exchange: Extended
 Market: BTC-USD
 Side: LONG
 Size: 0.25
-Entry: 63250.50
-Exit: 63880.00
+Entry: 63250.5
+Exit: 63880
 PnL: +157.38 USDC
 PnL %: +0.99% (approx.)
 Duration: 01h 42m

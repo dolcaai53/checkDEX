@@ -188,8 +188,15 @@ def test_map_position_basic_fields() -> None:
     assert pos.size == Decimal("2")
     assert pos.entry_price == Decimal("3000")
     assert pos.mark_price == Decimal("3050")
+    assert pos.last_price is None
     assert pos.leverage == Decimal("5")
     assert pos.unrealized_pnl == Decimal("100")
+
+
+def test_map_position_last_price() -> None:
+    pos = map_position(_sdk_position(), exchange="Extended", last_price=Decimal("3051.5"))
+    assert pos.last_price == Decimal("3051.5")
+    assert pos.mark_price == Decimal("3050")
 
 
 def test_map_position_short_side() -> None:

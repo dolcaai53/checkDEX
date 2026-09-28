@@ -19,6 +19,7 @@ class Position(BaseModel):
     size: Decimal
     entry_price: Decimal
     mark_price: Decimal | None = None
+    last_price: Decimal | None = None  # posledni obchodni cena; ve zpravach ma prednost pred mark
     leverage: Decimal | None = None
     unrealized_pnl: Decimal | None = None
     opened_at: datetime | None = None
