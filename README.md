@@ -90,6 +90,7 @@ Put that address into `.env` and run `docker compose up -d --force-recreate`.
 - If the role check itself fails (e.g. a timeout), a warning is logged and monitoring continues.
 - An address with no account activity on Hyperliquid is only logged as a warning — check it for typos.
 - Every Hyperliquid request has a 15-second timeout (the SDK sets none by default), so a slow API cannot block the monitor.
+- Hyperliquid does not send the mark price with positions. When positions are open, checkDEX asks for it with one extra public request (`metaAndAssetCtxs`) on each positions poll, so the daily summary, `/positions` and `POSITION UPDATED` show it on the `Mark` line. If that request fails, positions are still monitored and `Mark` shows `—`.
 
 ## Setting up the Telegram bot
 

@@ -17,6 +17,7 @@ from app.exchanges.hyperliquid import (
     map_fill_to_trade,
     map_order,
     map_position,
+    parse_mark_prices,
     parse_user_role,
 )
 from app.models.order import OrderSide, OrderStatus, OrderType
@@ -163,6 +164,44 @@ def test_map_position_no_unrealized_pnl():
     assert pos.unrealized_pnl is None
 
 
+def test_map_position_mark_price():
+    pos = map_position(_asset_position(), EXCHANGE, mark_price=Decimal("3150.5"))
+    assert pos.mark_price == Decimal("3150.5")
+
+
+def test_map_position_without_mark_price():
+    assert map_position(_asset_position(), EXCHANGE).mark_price is None
+
+
+# ---------------------------------------------------------------------------
+# parse_mark_prices
+# ---------------------------------------------------------------------------
+
+def _meta_and_ctxs(**mark_prices: str | None) -> list:
+    """Odpoved metaAndAssetCtxs: universe a assetCtxs ve stejnem poradi."""
+    universe = [{"name": coin, "szDecimals": 2} for coin in mark_prices]
+    ctxs = [{"markPx": px, "midPx": px, "oraclePx": px} for px in mark_prices.values()]
+    return [{"universe": universe}, ctxs]
+
+
+def test_parse_mark_prices():
+    response = _meta_and_ctxs(BTC="83096.0", DOGE="0.093")
+    assert parse_mark_prices(response) == {"BTC": Decimal("83096.0"), "DOGE": Decimal("0.093")}
+
+
+def test_parse_mark_prices_skips_market_without_price():
+    response = _meta_and_ctxs(BTC="83096.0", NEW=None)
+    assert parse_mark_prices(response) == {"BTC": Decimal("83096.0")}
+
+
+@pytest.mark.parametrize(
+    "response",
+    [None, "unexpected", {}, [], [{}], [{"universe": "x"}, []], [{"universe": []}, None]],
+)
+def test_parse_mark_prices_unexpected_response(response):
+    assert parse_mark_prices(response) == {}
+
+
 # ---------------------------------------------------------------------------
 # map_fill_to_trade
 # ---------------------------------------------------------------------------
@@ -259,7 +298,14 @@ def test_parse_user_role(response, expected):
 # connect() — SDK klient nahrazeny fake tridou, bez site
 # ---------------------------------------------------------------------------
 
-def _fake_info_class(role_response=None, init_error=None, post_error=None):
+def _fake_info_class(
+    role_response=None,
+    init_error=None,
+    post_error=None,
+    asset_positions=(),
+    ctxs_response=None,
+    ctxs_error=None,
+):
     """Vytvori nahradu hyperliquid.info.Info; instance jsou v FakeInfo.created."""
     created = []
 
@@ -271,6 +317,7 @@ def _fake_info_class(role_response=None, init_error=None, post_error=None):
             self.skip_ws = skip_ws
             self.timeout = timeout
             self.posts = []
+            self.ctxs_calls = 0
             created.append(self)
 
         def post(self, path, payload):
@@ -280,7 +327,13 @@ def _fake_info_class(role_response=None, init_error=None, post_error=None):
             return role_response
 
         def user_state(self, address):
-            return {"assetPositions": []}
+            return {"assetPositions": list(asset_positions)}
+
+        def meta_and_asset_ctxs(self):
+            self.ctxs_calls += 1
+            if ctxs_error is not None:
+                raise ctxs_error
+            return ctxs_response
 
     FakeInfo.created = created
     return FakeInfo
@@ -354,3 +407,67 @@ async def test_connect_wraps_client_init_error(monkeypatch):
 
     with pytest.raises(ExchangeConnectionError, match="network down"):
         await _adapter().connect()
+
+
+# ---------------------------------------------------------------------------
+# get_positions() — mark cena z metaAndAssetCtxs
+# ---------------------------------------------------------------------------
+
+async def _connected_adapter(monkeypatch, **fake_kwargs):
+    """Pripojeny adapter s fake Info (hlavni ucet); vraci (adapter, info)."""
+    fake = _fake_info_class(role_response={"role": "user"}, **fake_kwargs)
+    monkeypatch.setattr("hyperliquid.info.Info", fake)
+    adapter = _adapter()
+    await adapter.connect()
+    return adapter, fake.created[0]
+
+
+async def test_get_positions_fills_mark_price(monkeypatch):
+    adapter, info = await _connected_adapter(
+        monkeypatch,
+        asset_positions=[_asset_position(coin="ETH"), _asset_position(coin="DOGE", szi="-100")],
+        ctxs_response=_meta_and_ctxs(BTC="83096.0", ETH="2648.7", DOGE="0.093"),
+    )
+
+    positions = await adapter.get_positions()
+
+    assert {p.market: p.mark_price for p in positions} == {
+        "ETH-USDC": Decimal("2648.7"),
+        "DOGE-USDC": Decimal("0.093"),
+    }
+    assert info.ctxs_calls == 1  # jeden dotaz pro vsechny pozice
+
+
+async def test_get_positions_without_mark_price_when_fetch_fails(monkeypatch, caplog):
+    adapter, _ = await _connected_adapter(
+        monkeypatch,
+        asset_positions=[_asset_position(coin="ETH")],
+        ctxs_error=TimeoutError("read timed out"),
+    )
+
+    with caplog.at_level("WARNING"):
+        positions = await adapter.get_positions()
+
+    # Pozice se vrati dal, jen bez ceny — sledovani se nezastavi.
+    assert [p.market for p in positions] == ["ETH-USDC"]
+    assert positions[0].mark_price is None
+    assert "Hyperliquid mark prices fetch failed" in caplog.text
+
+
+async def test_get_positions_market_missing_in_prices(monkeypatch):
+    adapter, _ = await _connected_adapter(
+        monkeypatch,
+        asset_positions=[_asset_position(coin="ETH")],
+        ctxs_response=_meta_and_ctxs(BTC="83096.0"),
+    )
+
+    positions = await adapter.get_positions()
+
+    assert positions[0].mark_price is None
+
+
+async def test_get_positions_no_price_request_without_positions(monkeypatch):
+    adapter, info = await _connected_adapter(monkeypatch)
+
+    assert await adapter.get_positions() == []
+    assert info.ctxs_calls == 0

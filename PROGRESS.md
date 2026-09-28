@@ -2,7 +2,7 @@
 
 ## Stav projektu
 
-**Aktualni stav:** ✅ Projekt bezi v produkci na mainnetu (Extended) — Faze 1–7 hotove, runtime opravy overeny live. Pozdeji pridano: denni souhrn pozic, Hyperliquid adapter, vice DEXu soucasne, Telegram prikaz /positions — 126 testu prochazi. Nasazeni techto novych funkci na server neovereno.
+**Aktualni stav:** ✅ Projekt bezi v produkci na mainnetu (Extended) — Faze 1–7 hotove, runtime opravy overeny live. Pozdeji pridano: denni souhrn pozic, Hyperliquid adapter, vice DEXu soucasne, Telegram prikaz /positions, mark cena u Hyperliquid pozic — 192 testu prochazi. Nasazeni techto novych funkci na server neovereno.
 
 ---
 
@@ -92,18 +92,26 @@
 - `requirements.txt` — presne verze knihoven, se kterymi prochazeji testy
 - Nove testy: `tests/test_config.py` (13), `tests/test_main.py` (8), dalsi v event_engine, hyperliquid, storage, telegram
 
+### Mark cena u Hyperliquid pozic ✅ (2026-09-28)
+- Hyperliquid v pozicich (`clearinghouseState`) mark cenu neposila — radek `Mark` byl u Hyperliquid vzdy `—`
+- `get_positions()` ji doplni z verejneho dotazu `metaAndAssetCtxs` (`parse_mark_prices`), jen kdyz jsou otevrene pozice
+- Kdyz dotaz selze: varovani v logu, pozice se sleduji dal bez ceny
+- Projevi se v dennim souhrnu, `/positions` i `POSITION UPDATED`; Extended posila mark cenu s pozicemi uz driv
+- Overeno proti skutecnemu API (hlavni ucet): `Mark` u BTC a GRAM odpovida uPnL
+- 15 novych testu v `tests/test_hyperliquid.py`
+
 ---
 
 ## Testovací výsledky
 
 ```
-177 passed, 1 warning   (2026-09-27, v Dockeru; warning = DeprecationWarning z python-json-logger)
+192 passed, 1 warning   (2026-09-28, v Dockeru; warning = DeprecationWarning z python-json-logger)
 ```
 
 - tests/test_commands.py — 17 testu (/positions, getUpdates)
 - tests/test_config.py — 13 testu (ACTIVE_EXCHANGES carka/JSON, .env.example)
 - tests/test_event_engine.py — 37 testu (mapping + detekce + prvni spusteni)
-- tests/test_hyperliquid.py — 32 testu (mapping + connect, kontrola API penezenky)
+- tests/test_hyperliquid.py — 47 testu (mapping + connect, kontrola API penezenky, mark ceny)
 - tests/test_main.py — 8 testu (opakovani pripojeni, nezavislost burz, uklid)
 - tests/test_pnl.py — 16 testu
 - tests/test_storage.py — 25 testu

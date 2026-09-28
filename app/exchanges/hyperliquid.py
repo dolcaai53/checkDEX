@@ -81,8 +81,14 @@ def map_order(hl_order: dict, exchange: str) -> Order:
     )
 
 
-def map_position(hl_asset_pos: dict, exchange: str) -> Position:
-    """Map Hyperliquid assetPosition dict to internal Position model."""
+def map_position(
+    hl_asset_pos: dict, exchange: str, mark_price: Decimal | None = None
+) -> Position:
+    """Map Hyperliquid assetPosition dict to internal Position model.
+
+    Hyperliquid v assetPositions mark cenu neposila — adapter ji nacita zvlast
+    (viz parse_mark_prices) a predava v *mark_price*.
+    """
     pos = hl_asset_pos.get("position", hl_asset_pos)
     szi = Decimal(str(pos["szi"]))
     side = PositionSide.LONG if szi > 0 else PositionSide.SHORT
@@ -101,7 +107,7 @@ def map_position(hl_asset_pos: dict, exchange: str) -> Position:
         side=side,
         size=size,
         entry_price=Decimal(str(pos["entryPx"])),
-        mark_price=None,  # not in assetPositions; available via separate meta endpoint
+        mark_price=mark_price,
         leverage=leverage,
         unrealized_pnl=unrealized_pnl,
         opened_at=None,
@@ -154,6 +160,29 @@ def parse_user_role(response: object) -> tuple[str | None, str | None]:
     data = response.get("data")
     main_account = data.get("user") if role == "agent" and isinstance(data, dict) else None
     return (str(role) if role else None), (str(main_account) if main_account else None)
+
+
+def parse_mark_prices(response: object) -> dict[str, Decimal]:
+    """Z odpovedi Hyperliquid metaAndAssetCtxs vrati {coin: mark cena}.
+
+    Odpoved je [meta, assetCtxs]; meta["universe"][i] a assetCtxs[i] patri ke
+    stejnemu trhu. Trh bez platne ceny se vynecha, necekany tvar odpovedi
+    vrati prazdny slovnik.
+    """
+    if not isinstance(response, list) or len(response) < 2:
+        return {}
+    meta, ctxs = response[0], response[1]
+    universe = meta.get("universe") if isinstance(meta, dict) else None
+    if not isinstance(universe, list) or not isinstance(ctxs, list):
+        return {}
+
+    prices: dict[str, Decimal] = {}
+    for asset, ctx in zip(universe, ctxs):
+        try:
+            prices[str(asset["name"])] = Decimal(str(ctx["markPx"]))
+        except (KeyError, TypeError, ArithmeticError):
+            continue
+    return prices
 
 
 async def _fills_by_time(info, address: str, start_ms: int) -> list[dict]:
@@ -305,13 +334,19 @@ class HyperliquidAdapter(ExchangeAdapter):
         except Exception as exc:
             raise ExchangeConnectionError(f"get_positions failed: {exc}") from exc
 
+        asset_positions = state.get("assetPositions", [])
+        # Mark ceny se nacitaji jen kdyz jsou otevrene pozice — jinak neni co doplnit.
+        mark_prices = await self._get_mark_prices(info) if asset_positions else {}
+
         positions: list[Position] = []
-        for asset_pos in state.get("assetPositions", []):
+        for asset_pos in asset_positions:
             pos = asset_pos.get("position", {})
             if Decimal(str(pos.get("szi", "0"))) == 0:
                 continue
             try:
-                positions.append(map_position(asset_pos, self.exchange_name))
+                positions.append(
+                    map_position(asset_pos, self.exchange_name, mark_prices.get(pos.get("coin")))
+                )
             except Exception:
                 logger.debug(
                     "Skipping unparseable position",
@@ -319,6 +354,19 @@ class HyperliquidAdapter(ExchangeAdapter):
                 )
         logger.debug("Fetched positions", extra={"count": len(positions)})
         return positions
+
+    async def _get_mark_prices(self, info) -> dict[str, Decimal]:
+        """Aktualni mark ceny vsech trhu (verejny dotaz metaAndAssetCtxs).
+
+        Cena je ve zpravach jen informativni — kdyz dotaz selze, zaloguje se
+        varovani a pozice se vrati bez ni (sledovani pozic se nezastavi).
+        """
+        try:
+            response = await asyncio.to_thread(info.meta_and_asset_ctxs)
+        except Exception as exc:
+            logger.warning("Hyperliquid mark prices fetch failed", extra={"error": str(exc)})
+            return {}
+        return parse_mark_prices(response)
 
     async def get_orders_history(self, since: datetime) -> list[Order]:
         """Return recently filled orders reconstructed from user fills.
