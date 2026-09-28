@@ -118,6 +118,13 @@
 - README: projekt popsan jako Extended + Hyperliquid, sekce "Adding another exchange" (Lighter), poznamka o limitu a opakovani u Extended
 - 7 novych testu v `tests/test_extended.py`; na puvodnim kodu vsech 7 selze
 
+### README aktualizace + navod na instalaci a aktualizaci ✅ (2026-09-28)
+- Nove sekce: "Installation on a new server" (Docker, git clone, `.env`, prava `data/`, testy, start, kontrola), "Updating to the latest version" (s gitem i rucnim kopirovanim, zaloha DB, navrat na starsi verzi), "Everyday commands", "Daily position summary"
+- Uplna tabulka promennych prostredi podle `app/config.py`; u `UNREALIZED_PNL_THRESHOLD_USDC` a `NOTIFICATION_DEDUP_TTL_DAYS` uvedeno, ze zatim nemaji ucinek
+- Opraveno zastarale: pocet testu, vzor startovniho logu, priklad PnL %, chyba Telegram 400 (uz neshodi aplikaci), co Extended kontroluje pri pripojeni, Hyperliquid (uzavreni po fillech, zrusene ordery jako `DISAPPEARED_UNKNOWN`), omezeni pri vypadku
+- Overeno: cisty klon z GitHubu podle navodu → testy (239 passed) a start s vymyslenymi hodnotami vcetne ciste zastavky; `docker compose` funguje i bez `.env.test`; zalohovaci `tar` vynecha `data/` a `.env`; chybove hlasky SDK pro spatny format `EXTENDED_VAULT` a klicu; vsech 37 odkazu uvnitr README vede na existujici nadpis
+- Beze zmeny kodu
+
 ---
 
 ## Testovací výsledky
